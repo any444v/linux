@@ -20,6 +20,118 @@
 			no-map;
 		};
 	};
+
+	/*
+	 * SDM636 is SDM660 speed bin 3 (row 38 bits 29-31 of the qfprom). These
+	 * are the vendor qcom,pwrcl-speedbin3-v0 and qcom,perfcl-speedbin3-v0
+	 * OSM look-up tables: PLL override word, MEM-ACC level (spare data) and
+	 * CPRh virtual corner of each frequency. The corner frequencies of the
+	 * vendor CPRh plan for this bin also have silver 1843.2 MHz and gold
+	 * 2150.4/2208 MHz corners that the OSM never requests; they are the
+	 * fmax of the fuse corners that the top frequencies interpolate from.
+	 */
+	cpu_pwrcl_opp_table: opp-table-pwrcl {
+		compatible = "operating-points-v2-qcom-osm";
+		opp-shared;
+
+		qcom,cpr-fuse-corner-fmax-hz = /bits/ 64 <633600000 902400000
+							  1113600000 1401600000
+							  1843200000>;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			required-opps = <&cprh_opp1>;
+			qcom,pll-override = <0x01200020>;
+			qcom,spare-data = <1>;
+		};
+
+		opp-633600000 {
+			opp-hz = /bits/ 64 <633600000>;
+			required-opps = <&cprh_opp2>;
+			qcom,pll-override = <0x03200020>;
+			qcom,spare-data = <1>;
+			qcom,pll-div = <1>;
+		};
+
+		opp-902400000 {
+			opp-hz = /bits/ 64 <902400000>;
+			required-opps = <&cprh_opp3>;
+			qcom,pll-override = <0x04260026>;
+			qcom,spare-data = <1>;
+		};
+
+		opp-1113600000 {
+			opp-hz = /bits/ 64 <1113600000>;
+			required-opps = <&cprh_opp4>;
+			qcom,pll-override = <0x052e002e>;
+			qcom,spare-data = <2>;
+		};
+
+		opp-1401600000 {
+			opp-hz = /bits/ 64 <1401600000>;
+			required-opps = <&cprh_opp5>;
+			qcom,pll-override = <0x073a003a>;
+			qcom,spare-data = <2>;
+		};
+
+		opp-1536000000 {
+			opp-hz = /bits/ 64 <1536000000>;
+			required-opps = <&cprh_opp6>;
+			qcom,pll-override = <0x08400040>;
+			qcom,spare-data = <2>;
+		};
+
+		opp-1612800000 {
+			opp-hz = /bits/ 64 <1612800000>;
+			required-opps = <&cprh_opp7>;
+			qcom,pll-override = <0x09430043>;
+			qcom,spare-data = <2>;
+		};
+	};
+
+	cpu_perfcl_opp_table: opp-table-perfcl {
+		compatible = "operating-points-v2-qcom-osm";
+		opp-shared;
+
+		qcom,cpr-fuse-corner-fmax-hz = /bits/ 64 <1113600000 1401600000
+							  1747200000 2150400000
+							  2208000000>;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			required-opps = <&cprh_opp1>;
+			qcom,pll-override = <0x01200020>;
+			qcom,spare-data = <1>;
+		};
+
+		opp-1113600000 {
+			opp-hz = /bits/ 64 <1113600000>;
+			required-opps = <&cprh_opp2>;
+			qcom,pll-override = <0x052e002e>;
+			qcom,spare-data = <1>;
+		};
+
+		opp-1401600000 {
+			opp-hz = /bits/ 64 <1401600000>;
+			required-opps = <&cprh_opp3>;
+			qcom,pll-override = <0x073a003a>;
+			qcom,spare-data = <2>;
+		};
+
+		opp-1747200000 {
+			opp-hz = /bits/ 64 <1747200000>;
+			required-opps = <&cprh_opp4>;
+			qcom,pll-override = <0x09480048>;
+			qcom,spare-data = <2>;
+		};
+
+		opp-1804800000 {
+			opp-hz = /bits/ 64 <1804800000>;
+			required-opps = <&cprh_opp5>;
+			qcom,pll-override = <0x094b004b>;
+			qcom,spare-data = <2>;
+		};
+	};
 };
 
 &adreno_gpu {
