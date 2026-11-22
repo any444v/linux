@@ -1092,7 +1092,7 @@ static irqreturn_t smb_handle_type_c_change(int irq, void *data)
 	struct smb_chip *chip = data;
 
 	/* In micro-USB mode this interrupt reports ID pin changes */
-	mod_delayed_work(system_wq, &chip->otg_work,
+	mod_delayed_work(system_percpu_wq, &chip->otg_work,
 			 msecs_to_jiffies(OTG_DEGLITCH_MS));
 
 	return IRQ_HANDLED;
@@ -1110,6 +1110,47 @@ static void smb_otg_teardown(void *data)
 		smb_write_usbin_suspend(chip, chip->usbin_suspend_req);
 	}
 	mutex_unlock(&chip->otg_lock);
+}
+
+/*
+ * Restart the Type-C state machine in micro-USB mode, with the sequence of
+ * the vendor driver. Selecting the mode alone is not enough: left in another
+ * state, as by the bootloader after "fastboot boot", the machine stays in
+ * micro-USB mode without sensing the ID pin at all.
+ */
+static int smb_restart_micro_usb_fsm(struct smb_chip *chip)
+{
+	static const struct {
+		u16 addr;
+		u8 mask;
+		u8 val;
+		unsigned int delay_ms;
+	} seq[] = {
+		/* stop the state machine, then go through Type-C mode */
+		{ TYPE_C_INTRPT_ENB_SOFTWARE_CTRL,
+		  TYPEC_DISABLE_CMD_BIT | UFP_EN_CMD_BIT, TYPEC_DISABLE_CMD_BIT,
+		  200 },
+		{ TYPE_C_CFG, TYPE_C_OR_U_USB_BIT, 0, 10 },
+		{ TYPE_C_INTRPT_ENB_SOFTWARE_CTRL, TYPEC_DISABLE_CMD_BIT, 0,
+		  100 },
+		/* stop it again and start it in micro-USB mode */
+		{ TYPE_C_INTRPT_ENB_SOFTWARE_CTRL, TYPEC_DISABLE_CMD_BIT,
+		  TYPEC_DISABLE_CMD_BIT, 200 },
+		{ TYPE_C_CFG, TYPE_C_OR_U_USB_BIT, TYPE_C_OR_U_USB_BIT, 10 },
+		{ TYPE_C_INTRPT_ENB_SOFTWARE_CTRL, TYPEC_DISABLE_CMD_BIT, 0, 0 },
+	};
+	int i, rc;
+
+	for (i = 0; i < ARRAY_SIZE(seq); i++) {
+		rc = regmap_update_bits(chip->regmap, chip->base + seq[i].addr,
+					seq[i].mask, seq[i].val);
+		if (rc < 0)
+			return rc;
+		if (seq[i].delay_ms)
+			msleep(seq[i].delay_ms);
+	}
+
+	return 0;
 }
 
 static void smb_put_role_switch(void *data)
@@ -1154,11 +1195,10 @@ static int smb_init_micro_usb_otg(struct smb_chip *chip)
 	if (rc)
 		return rc;
 
-	rc = regmap_update_bits(chip->regmap, chip->base + TYPE_C_CFG,
-				TYPE_C_OR_U_USB_BIT, TYPE_C_OR_U_USB_BIT);
+	rc = smb_restart_micro_usb_fsm(chip);
 	if (rc < 0)
 		return dev_err_probe(chip->dev, rc,
-				     "Couldn't select micro-USB mode\n");
+				     "Couldn't start micro-USB mode\n");
 
 	rc = regmap_read(chip->regmap, chip->base + USBIN_CMD_IL, &val);
 	if (rc < 0)
@@ -1190,7 +1230,8 @@ static int smb_init_micro_usb_otg(struct smb_chip *chip)
 				     "Couldn't request irq type-c-change\n");
 
 	/* Pick up an adapter that was plugged in before probe */
-	schedule_delayed_work(&chip->otg_work, 0);
+	schedule_delayed_work(&chip->otg_work,
+			      msecs_to_jiffies(OTG_DEGLITCH_MS));
 
 	return 0;
 }
