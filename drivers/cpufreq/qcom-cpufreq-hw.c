@@ -996,9 +996,24 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 		acc_idx++;
 	}
 
-	/* Sanity check: we *must* have two mem-acc crossovers (four values) */
-	if (acc_idx < SEQ_MEM_ACC_MAX_LEVELS - 1)
+	/* Sanity check: we need at least one mem-acc crossover (two values) */
+	if (acc_idx < 2) {
+		dev_err(cpu_dev, "No MEM-ACC level change in the LUT\n");
 		return -EINVAL;
+	}
+
+	/*
+	 * A LUT can stop at MEM-ACC level 2: SDM636 (SDM660 speed bin 3) has
+	 * no level 3 corner.  The vendor driver leaves the missing crossover
+	 * of its mem_acc_level_map[] at zero, programming the pair as corners
+	 * 0 and 1 (clk_osm_program_mem_acc_regs() in clk-cpu-osm-660.c): do
+	 * the same.
+	 */
+	if (acc_idx < SEQ_MEM_ACC_MAX_LEVELS) {
+		acc_val[2] = 0;
+		acc_val[3] = 1;
+		dev_dbg(cpu_dev, "LUT has no MEM-ACC level 3 corner\n");
+	}
 
 	if (qcom_cpufreq_osm_stop_after(cpu_dev, index, 2, "lut"))
 		return -ECANCELED;
@@ -1057,8 +1072,14 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 	/*
 	 * Array Power Mux threshold level: the first virtual corner
 	 * that requires a switch sequence of the APM from MX to APC.
+	 *
+	 * When no corner reaches the APM threshold voltage (SDM636 parts
+	 * can run their whole LUT from MX), qcom_cpufreq_gen_params() leaves
+	 * it negative: use the highest virtual corner, as the vendor driver
+	 * does (MAX_VIRTUAL_CORNER in clk-cpu-osm-660.c), instead of writing
+	 * -1 to the sequencer.
 	 */
-	if (apm_vc == INT_MAX)
+	if (apm_vc < 0 || apm_vc == INT_MAX)
 		apm_vc = LUT_MAX_ENTRIES - 1;
 
 	/*
@@ -1083,7 +1104,9 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 	if (ret)
 		return ret;
 
-	ret = qcom_scm_io_writel(SEQUENCER_REG(seq_addr, SEQ_APM_THRESH_PREVC), apm_vc - 1);
+	/* The vendor driver writes 0xff ("minus one") below corner 1 */
+	ret = qcom_scm_io_writel(SEQUENCER_REG(seq_addr, SEQ_APM_THRESH_PREVC),
+				 apm_vc ? apm_vc - 1 : 0xff);
 	if (ret)
 		return ret;
 
@@ -1092,6 +1115,11 @@ static int qcom_cpufreq_hw_write_lut(struct device *cpu_dev,
 	if (ret)
 		return ret;
 	dev_dbg(cpu_dev, "Wrote APM Pair: [%u-%u]\n", apm_vc - 1, apm_vc);
+
+	dev_info(cpu_dev,
+		 "OSM domain %d: %u LUT entries, MEM-ACC [%d-%d] [%d-%d], APM threshold VC %d, crossover VC %u\n",
+		 index, num_entries, acc_val[0], acc_val[1], acc_val[2],
+		 acc_val[3], apm_vc, num_entries);
 
 	if (qcom_cpufreq_osm_stop_after(cpu_dev, index, 3, "sequencer"))
 		return -ECANCELED;
