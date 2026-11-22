@@ -1440,7 +1440,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 		 * Make sure that the frequencies in the table are in ascending
 		 * order, as this is critical for the algorithm to work.
 		 */
-		if (cdata[level - 2].freq > freq) {
+		if (level > 1 && cdata[level - 2].freq > freq) {
 			dev_err(drv->dev, "Frequency table not in ascending order.\n");
 			return -EINVAL;
 		}
