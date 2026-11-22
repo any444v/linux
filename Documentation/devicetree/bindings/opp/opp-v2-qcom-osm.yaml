@@ -25,6 +25,18 @@ properties:
 
   opp-shared: true
 
+  qcom,cpr-fuse-corner-fmax-hz:
+    description:
+      Highest frequency (fmax) of each CPR fuse corner of the vendor corner
+      plan of this cluster, lowest fuse corner first. The open-loop voltage
+      of a corner between two fuse corners is interpolated between their
+      fmax; this sets it when the speed bin of the table stops below it
+      (SDM636 has neither the 1843.2 MHz silver nor the 2150.4 MHz gold
+      fmax). A zero entry keeps the highest OPP of that fuse corner.
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 1
+    maxItems: 8
+
 patternProperties:
   '^opp-?[0-9]+$':
     type: object

@@ -105,6 +105,14 @@ properties:
   '#clock-cells':
     const: 1
 
+  qcom,saw:
+    description:
+      L2 SAW of each cluster, which passes the CPR-Hardened voltage requests
+      on to the PMIC. The OSM is only programmed once they are set up.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      maxItems: 1
+
 required:
   - compatible
   - reg
@@ -137,6 +145,8 @@ allOf:
         interrupt-names: false
     else:
       properties:
+        qcom,saw: false
+
         reg-names:
           items:
             enum:

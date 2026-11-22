@@ -52,6 +52,15 @@ patternProperties:
         minItems: 1
         maxItems: 2
 
+      qcom,opp-floor-microvolt:
+        description: |
+          Floor voltage of this corner in microvolts, one entry per CPR
+          thread, in the same order as qcom,opp-fuse-level. It can be lower
+          than the floor of its fuse corner, which otherwise applies.
+        $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 1
+        maxItems: 2
+
     required:
       - opp-level
       - qcom,opp-fuse-level
