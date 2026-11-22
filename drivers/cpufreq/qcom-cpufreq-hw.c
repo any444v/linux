@@ -1949,6 +1949,41 @@ static struct resource *qcom_cpufreq_hw_domain_res(struct platform_device *pdev,
 	return platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
 }
 
+/**
+ * qcom_cpufreq_hw_saws_ready() - Check that the L2 SAWs are set up
+ * @dev: OSM device
+ *
+ * On SDM630/660 the CPRh voltage requests reach the PMIC through the AVS
+ * port of the L2 SAW of each cluster, which the spm driver programs: the
+ * OSM must not start switching corners before that.  The optional
+ * "qcom,saw" property lists those SAWs.
+ *
+ * Returns: Zero when every listed SAW is bound to its driver, -EPROBE_DEFER
+ *          otherwise.
+ */
+static int qcom_cpufreq_hw_saws_ready(struct device *dev)
+{
+	struct of_phandle_iterator it;
+	int ret;
+
+	of_for_each_phandle(&it, ret, dev->of_node, "qcom,saw", NULL, 0) {
+		struct platform_device *saw = of_find_device_by_node(it.node);
+		bool bound = saw && device_is_bound(&saw->dev);
+
+		if (saw)
+			put_device(&saw->dev);
+
+		if (!bound) {
+			ret = dev_err_probe(dev, -EPROBE_DEFER,
+					    "waiting for L2 SAW %pOF\n", it.node);
+			of_node_put(it.node);
+			return ret;
+		}
+	}
+
+	return ret == -ENOENT ? 0 : ret;
+}
+
 static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 {
 	struct clk_hw_onecell_data *clk_data;
@@ -1999,6 +2034,10 @@ static int qcom_cpufreq_hw_driver_probe(struct platform_device *pdev)
 		if (!pd_dev || !pd_dev->dev.driver ||
 		    !device_is_bound(&pd_dev->dev))
 			return -EPROBE_DEFER;
+
+		ret = qcom_cpufreq_hw_saws_ready(dev);
+		if (ret)
+			return ret;
 	}
 
 	clk = clk_get(dev, "xo");
