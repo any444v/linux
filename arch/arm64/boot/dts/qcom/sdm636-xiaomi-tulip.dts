@@ -334,6 +334,18 @@
 	monitored-battery = <&battery>;
 
 	status = "okay";
+
+	connector {
+		compatible = "usb-b-connector";
+		label = "micro-USB";
+		type = "micro";
+
+		port {
+			pm660_charger_usb_ep: endpoint {
+				remote-endpoint = <&usb3_dwc3_hs_ep>;
+			};
+		};
+	};
 };
 
 &pm660_fg {
@@ -952,7 +964,15 @@
 	maximum-speed = "high-speed";
 	phys = <&qusb2phy0>;
 	phy-names = "usb2-phy";
-	dr_mode = "peripheral";
+	dr_mode = "otg";
+	usb-role-switch;
+	role-switch-default-mode = "peripheral";
+
+	port {
+		usb3_dwc3_hs_ep: endpoint {
+			remote-endpoint = <&pm660_charger_usb_ep>;
+		};
+	};
 };
 
 &venus {
