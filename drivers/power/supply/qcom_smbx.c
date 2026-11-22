@@ -9,18 +9,22 @@
  */
 
 #include <linux/bits.h>
+#include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/iio/consumer.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeirq.h>
 #include <linux/of.h>
 #include <linux/power_supply.h>
+#include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/types.h>
+#include <linux/usb/role.h>
 #include <linux/workqueue.h>
 
 /* clang-format off */
@@ -100,6 +104,18 @@
 #define USBIN_UV_RT_STS_BIT				BIT(2)
 #define USBIN_LT_3P6V_RT_STS_BIT			BIT(1)
 #define USBIN_COLLAPSE_RT_STS_BIT			BIT(0)
+
+#define RID_CC_CONTROL_7_0				0x108
+#define EN_MICRO_USB_MODE_BIT				BIT(5)
+
+#define OTG_STATUS					0x109
+#define BOOST_SOFTSTART_DONE_BIT			BIT(3)
+
+#define CMD_OTG						0x140
+#define OTG_EN_BIT					BIT(0)
+
+#define OTG_CURRENT_LIMIT_CFG				0x152
+#define OTG_CURRENT_LIMIT_MASK				GENMASK(2, 0)
 
 #define OTG_CFG						0x153
 #define OTG_RESERVED_MASK				GENMASK(7, 6)
@@ -355,6 +371,14 @@
 #define SMB2_FLOAT_VOLTAGE_MIN_UV			3487500
 #define SMB2_FLOAT_VOLTAGE_MAX_UV			4920000
 #define SMB2_FLOAT_VOLTAGE_STEP_UV			7500
+
+/* OTG boost current limit: 250 mA to 2 A in 250 mA steps */
+#define OTG_CURRENT_LIMIT_MIN_UA			250000
+#define OTG_CURRENT_LIMIT_STEP_UA			250000
+#define OTG_CURRENT_LIMIT_UA				1500000
+#define OTG_SOFTSTART_POLLS				15
+/* ID pin debounce, the vendor driver's default "otg-deglitch-time-ms" */
+#define OTG_DEGLITCH_MS					50
 /* clang-format on */
 
 enum charger_status {
@@ -388,6 +412,12 @@ struct smb_init_register {
  * @usb_in_i_chan:	USB_IN current measurement channel
  * @usb_in_v_chan:	USB_IN voltage measurement channel
  * @chg_psy:		Charger power supply instance
+ * @role_sw:		USB role switch of the micro-USB connector, or NULL
+ * @otg_work:		Worker that follows the micro-USB ID pin
+ * @otg_lock:		Protects @otg_active and @usbin_suspend_req
+ * @otg_active:		The OTG boost drives VBUS and the port is a host
+ * @usbin_suspend_req:	USB input suspend state requested through the power
+ *			supply class, applied once the OTG boost is off
  */
 struct smb_chip {
 	struct device *dev;
@@ -405,6 +435,12 @@ struct smb_chip {
 	struct iio_channel *usb_in_v_chan;
 
 	struct power_supply *chg_psy;
+
+	struct usb_role_switch *role_sw;
+	struct delayed_work otg_work;
+	struct mutex otg_lock;
+	bool otg_active;
+	bool usbin_suspend_req;
 };
 
 static enum power_supply_property smb_properties[] = {
@@ -436,16 +472,59 @@ static int smb_get_prop_usb_online(struct smb_chip *chip, int *val)
 	return 0;
 }
 
+static int smb_write_usbin_suspend(struct smb_chip *chip, bool suspend)
+{
+	return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
+				  USBIN_SUSPEND_BIT,
+				  suspend ? USBIN_SUSPEND_BIT : 0);
+}
+
+/*
+ * The USB input stays suspended while the OTG boost drives VBUS, so that the
+ * charger does not take its own output as input. A suspend state requested
+ * meanwhile is kept and applied when the boost turns off.
+ */
+static int smb_set_usbin_suspend(struct smb_chip *chip, bool suspend)
+{
+	int rc = 0;
+
+	mutex_lock(&chip->otg_lock);
+	chip->usbin_suspend_req = suspend;
+	if (!chip->otg_active)
+		rc = smb_write_usbin_suspend(chip, suspend);
+	mutex_unlock(&chip->otg_lock);
+
+	return rc;
+}
+
+static int smb_get_usbin_suspend(struct smb_chip *chip, bool *suspend)
+{
+	unsigned int val;
+	int rc = 0;
+
+	mutex_lock(&chip->otg_lock);
+	if (chip->otg_active) {
+		*suspend = chip->usbin_suspend_req;
+	} else {
+		rc = regmap_read(chip->regmap, chip->base + USBIN_CMD_IL, &val);
+		*suspend = !rc && (val & USBIN_SUSPEND_BIT);
+	}
+	mutex_unlock(&chip->otg_lock);
+
+	return rc;
+}
+
 static int smb_get_prop_charge_behaviour(struct smb_chip *chip, int *val)
 {
-	unsigned int chg_en, usb_susp;
+	unsigned int chg_en;
+	bool usb_susp;
 	int rc;
 
-	rc = regmap_read(chip->regmap, chip->base + USBIN_CMD_IL, &usb_susp);
+	rc = smb_get_usbin_suspend(chip, &usb_susp);
 	if (rc < 0)
 		return rc;
 
-	if (usb_susp & USBIN_SUSPEND_BIT) {
+	if (usb_susp) {
 		*val = POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE;
 		return 0;
 	}
@@ -731,21 +810,22 @@ static int smb_get_property(struct power_supply *psy,
  */
 static int smb_set_charge_behaviour(struct smb_chip *chip, int behaviour)
 {
-	unsigned int chg_en, usb_susp;
+	unsigned int chg_en;
+	bool usb_susp;
 	int rc;
 
 	switch (behaviour) {
 	case POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO:
 		chg_en = CHARGING_ENABLE_CMD_BIT;
-		usb_susp = 0;
+		usb_susp = false;
 		break;
 	case POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE:
 		chg_en = 0;
-		usb_susp = 0;
+		usb_susp = false;
 		break;
 	case POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE:
 		chg_en = 0;
-		usb_susp = USBIN_SUSPEND_BIT;
+		usb_susp = true;
 		break;
 	default:
 		return -EINVAL;
@@ -757,8 +837,7 @@ static int smb_set_charge_behaviour(struct smb_chip *chip, int behaviour)
 	if (rc < 0)
 		return rc;
 
-	return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
-				  USBIN_SUSPEND_BIT, usb_susp);
+	return smb_set_usbin_suspend(chip, usb_susp);
 }
 
 static int smb_set_property(struct power_supply *psy,
@@ -769,8 +848,7 @@ static int smb_set_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_STATUS:
-		return regmap_update_bits(chip->regmap, chip->base + USBIN_CMD_IL,
-					  USBIN_SUSPEND_BIT, !val->intval);
+		return smb_set_usbin_suspend(chip, !val->intval);
 	case POWER_SUPPLY_PROP_CURRENT_MAX:
 		return smb_set_current_limit(chip, val->intval);
 	case POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR:
@@ -860,6 +938,261 @@ static irqreturn_t smb_handle_wdog_bark(int irq, void *data)
 		dev_err(chip->dev, "Couldn't pet the dog rc=%d\n", rc);
 
 	return IRQ_HANDLED;
+}
+
+static int smb_otg_set_current_limit(struct smb_chip *chip, unsigned int ua)
+{
+	return regmap_update_bits(chip->regmap,
+				  chip->base + OTG_CURRENT_LIMIT_CFG,
+				  OTG_CURRENT_LIMIT_MASK,
+				  (ua - OTG_CURRENT_LIMIT_MIN_UA) /
+					  OTG_CURRENT_LIMIT_STEP_UA);
+}
+
+static void smb_otg_disable(struct smb_chip *chip)
+{
+	int rc;
+
+	rc = smb_otg_set_current_limit(chip, OTG_CURRENT_LIMIT_MIN_UA);
+	if (rc < 0)
+		dev_err(chip->dev, "Couldn't set OTG current limit: %d\n", rc);
+
+	rc = regmap_write(chip->regmap, chip->base + CMD_OTG, 0);
+	if (rc < 0)
+		dev_err(chip->dev, "Couldn't disable OTG boost: %d\n", rc);
+
+	rc = regmap_update_bits(chip->regmap, chip->base + OTG_ENG_OTG_CFG,
+				ENG_BUCKBOOST_HALT1_8_MODE_BIT, 0);
+	if (rc < 0)
+		dev_err(chip->dev, "Couldn't leave halt 1 in 8 mode: %d\n", rc);
+}
+
+/*
+ * The PM660 boost may not finish its soft start into a device with a large
+ * input capacitance. Like the vendor driver, start it with a low current
+ * limit and raise the limit step by step until the soft start completes.
+ */
+static const unsigned int smb_otg_softstart_ua[] = {
+	250000, 500000, 1000000, 1500000,
+};
+
+static int smb_otg_enable(struct smb_chip *chip)
+{
+	unsigned int stat;
+	int i, poll, rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + OTG_ENG_OTG_CFG,
+				ENG_BUCKBOOST_HALT1_8_MODE_BIT,
+				ENG_BUCKBOOST_HALT1_8_MODE_BIT);
+	if (rc < 0)
+		return rc;
+
+	for (i = 0; i < ARRAY_SIZE(smb_otg_softstart_ua); i++) {
+		rc = smb_otg_set_current_limit(chip, smb_otg_softstart_ua[i]);
+		if (rc < 0)
+			goto err;
+
+		rc = regmap_write(chip->regmap, chip->base + CMD_OTG,
+				  OTG_EN_BIT);
+		if (rc < 0)
+			goto err;
+
+		for (poll = 0; poll < OTG_SOFTSTART_POLLS; poll++) {
+			if (poll > 5)
+				usleep_range(9000, 9100);
+			else
+				usleep_range(2000, 2100);
+
+			rc = regmap_read(chip->regmap, chip->base + OTG_STATUS,
+					 &stat);
+			if (rc < 0)
+				goto err;
+
+			if (stat & BOOST_SOFTSTART_DONE_BIT) {
+				rc = smb_otg_set_current_limit(chip,
+							       OTG_CURRENT_LIMIT_UA);
+				if (rc < 0)
+					goto err;
+				return 0;
+			}
+		}
+
+		dev_dbg(chip->dev, "OTG soft start failed at %u uA\n",
+			smb_otg_softstart_ua[i]);
+		rc = regmap_write(chip->regmap, chip->base + CMD_OTG, 0);
+		if (rc < 0)
+			goto err;
+	}
+
+	rc = -ETIMEDOUT;
+err:
+	smb_otg_disable(chip);
+	return rc;
+}
+
+static void smb_otg_work(struct work_struct *work)
+{
+	struct smb_chip *chip = container_of(work, struct smb_chip,
+					     otg_work.work);
+	unsigned int stat;
+	bool host;
+	int rc;
+
+	rc = regmap_read(chip->regmap, chip->base + TYPE_C_STATUS_3, &stat);
+	if (rc < 0) {
+		dev_err(chip->dev, "Couldn't read TYPE_C_STATUS_3: %d\n", rc);
+		return;
+	}
+
+	host = stat & (U_USB_GND_NOVBUS_BIT | U_USB_GND_BIT);
+	dev_dbg(chip->dev, "TYPE_C_STATUS_3 0x%02x, ID %s\n", stat,
+		host ? "grounded" : "floating");
+
+	mutex_lock(&chip->otg_lock);
+	if (host == chip->otg_active)
+		goto unlock;
+
+	if (host) {
+		rc = smb_write_usbin_suspend(chip, true);
+		if (rc < 0) {
+			dev_err(chip->dev, "Couldn't suspend USB input: %d\n",
+				rc);
+			goto unlock;
+		}
+
+		rc = smb_otg_enable(chip);
+		if (rc < 0) {
+			dev_err(chip->dev, "Couldn't enable OTG boost: %d\n",
+				rc);
+			smb_write_usbin_suspend(chip, chip->usbin_suspend_req);
+			goto unlock;
+		}
+
+		chip->otg_active = true;
+		rc = usb_role_switch_set_role(chip->role_sw, USB_ROLE_HOST);
+	} else {
+		rc = usb_role_switch_set_role(chip->role_sw, USB_ROLE_DEVICE);
+		smb_otg_disable(chip);
+		chip->otg_active = false;
+		smb_write_usbin_suspend(chip, chip->usbin_suspend_req);
+	}
+
+	if (rc < 0)
+		dev_err(chip->dev, "Couldn't set USB role: %d\n", rc);
+	dev_info(chip->dev, "micro-USB ID %s, OTG boost %s\n",
+		 host ? "grounded" : "floating", host ? "on" : "off");
+
+unlock:
+	mutex_unlock(&chip->otg_lock);
+	power_supply_changed(chip->chg_psy);
+}
+
+static irqreturn_t smb_handle_type_c_change(int irq, void *data)
+{
+	struct smb_chip *chip = data;
+
+	/* In micro-USB mode this interrupt reports ID pin changes */
+	mod_delayed_work(system_wq, &chip->otg_work,
+			 msecs_to_jiffies(OTG_DEGLITCH_MS));
+
+	return IRQ_HANDLED;
+}
+
+static void smb_otg_teardown(void *data)
+{
+	struct smb_chip *chip = data;
+
+	mutex_lock(&chip->otg_lock);
+	if (chip->otg_active) {
+		usb_role_switch_set_role(chip->role_sw, USB_ROLE_DEVICE);
+		smb_otg_disable(chip);
+		chip->otg_active = false;
+		smb_write_usbin_suspend(chip, chip->usbin_suspend_req);
+	}
+	mutex_unlock(&chip->otg_lock);
+}
+
+static void smb_put_role_switch(void *data)
+{
+	usb_role_switch_put(data);
+}
+
+/*
+ * PMICs strapped for a micro-USB connector run the Type-C block in micro-USB
+ * mode, where it reports the ID pin. With a connector described, follow the
+ * ID pin: drive VBUS from the OTG boost and switch the USB controller to host
+ * while the ID pin is grounded.
+ */
+static int smb_init_micro_usb_otg(struct smb_chip *chip)
+{
+	struct fwnode_handle *connector;
+	unsigned int val;
+	int irq, rc;
+
+	rc = regmap_read(chip->regmap, chip->base + RID_CC_CONTROL_7_0, &val);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read RID_CC_CONTROL_7_0\n");
+	if (!(val & EN_MICRO_USB_MODE_BIT))
+		return 0;
+
+	connector = device_get_named_child_node(chip->dev, "connector");
+	if (!connector)
+		return 0;
+
+	chip->role_sw = fwnode_usb_role_switch_get(connector);
+	fwnode_handle_put(connector);
+	if (IS_ERR(chip->role_sw))
+		return dev_err_probe(chip->dev, PTR_ERR(chip->role_sw),
+				     "Couldn't get the USB role switch\n");
+	if (!chip->role_sw)
+		return dev_err_probe(chip->dev, -ENODEV,
+				     "Connector has no USB role switch\n");
+
+	rc = devm_add_action_or_reset(chip->dev, smb_put_role_switch,
+				      chip->role_sw);
+	if (rc)
+		return rc;
+
+	rc = regmap_update_bits(chip->regmap, chip->base + TYPE_C_CFG,
+				TYPE_C_OR_U_USB_BIT, TYPE_C_OR_U_USB_BIT);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't select micro-USB mode\n");
+
+	rc = regmap_read(chip->regmap, chip->base + USBIN_CMD_IL, &val);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't read USBIN_CMD_IL\n");
+	chip->usbin_suspend_req = val & USBIN_SUSPEND_BIT;
+
+	/* Registered before the work, so it runs after the work is cancelled */
+	rc = devm_add_action_or_reset(chip->dev, smb_otg_teardown, chip);
+	if (rc)
+		return rc;
+
+	rc = devm_delayed_work_autocancel(chip->dev, &chip->otg_work,
+					  smb_otg_work);
+	if (rc)
+		return dev_err_probe(chip->dev, rc,
+				     "Failed to init OTG work\n");
+
+	irq = platform_get_irq_byname(to_platform_device(chip->dev),
+				      "type-c-change");
+	if (irq < 0)
+		return irq;
+
+	rc = devm_request_threaded_irq(chip->dev, irq, NULL,
+				       smb_handle_type_c_change, IRQF_ONESHOT,
+				       "type-c-change", chip);
+	if (rc < 0)
+		return dev_err_probe(chip->dev, rc,
+				     "Couldn't request irq type-c-change\n");
+
+	/* Pick up an adapter that was plugged in before probe */
+	schedule_delayed_work(&chip->otg_work, 0);
+
+	return 0;
 }
 
 static const struct power_supply_desc smb_psy_desc = {
@@ -1049,6 +1382,10 @@ static int smb_probe(struct platform_device *pdev)
 	chip->dev = &pdev->dev;
 	chip->name = pdev->name;
 
+	rc = devm_mutex_init(chip->dev, &chip->otg_lock);
+	if (rc)
+		return rc;
+
 	chip->regmap = dev_get_regmap(pdev->dev.parent, NULL);
 	if (!chip->regmap)
 		return dev_err_probe(chip->dev, -ENODEV,
@@ -1178,6 +1515,10 @@ skip_float_voltage:
 		return dev_err_probe(chip->dev, irq,
 				     "Couldn't get irq chg-state-change\n");
 	}
+
+	rc = smb_init_micro_usb_otg(chip);
+	if (rc < 0)
+		return rc;
 
 	devm_device_init_wakeup(chip->dev);
 
