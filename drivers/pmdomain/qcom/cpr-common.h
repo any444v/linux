@@ -67,6 +67,7 @@ struct corner_data {
 	unsigned long freq;
 	int oloop_vadj;
 	int cloop_vadj;
+	int floor_uV;
 };
 
 struct acc_desc {

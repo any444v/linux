@@ -1348,6 +1348,101 @@ static void cpr3_arm_loop(struct cpr_thread *thread)
 }
 
 /**
+ * cpr3_get_corner_floor() - Get the optional floor voltage of a corner
+ * @opp: OPP of the CPR controller for this corner
+ * @tid: Thread number
+ *
+ * Vendor corner plans give every corner its own floor voltage, which can be
+ * below the floor of the highest corner of the same fuse corner (SDM660:
+ * silver 1536 MHz has a 744 mV floor, its fuse corner tops out at 844 mV).
+ * "qcom,opp-floor-microvolt" holds it per thread, like "qcom,opp-fuse-level";
+ * a single value applies to all threads.
+ *
+ * Return: The floor in microvolts, or 0 when the OPP does not have one.
+ */
+static int cpr3_get_corner_floor(struct dev_pm_opp *opp, u32 tid)
+{
+	struct device_node *np = dev_pm_opp_get_of_node(opp);
+	u32 uV;
+
+	if (of_property_read_u32_index(np, "qcom,opp-floor-microvolt", tid, &uV) &&
+	    of_property_read_u32_index(np, "qcom,opp-floor-microvolt", 0, &uV))
+		uV = 0;
+
+	of_node_put(np);
+
+	return uV;
+}
+
+/**
+ * cpr3_fuse_fmax_override() - Take the fmax of each fuse corner from DT
+ * @thread: Structure holding CPR thread-specific parameters
+ *
+ * The open-loop voltage of a corner that sits between two fuse corners is
+ * interpolated between the fmax (highest frequency) of these fuse corners,
+ * which is the highest CPU OPP mapped to each of them.  A speed bin can stop
+ * below the fmax of its top fuse corner though: SDM636 (SDM660 speed bin 3)
+ * runs silver up to 1612.8 MHz and gold up to 1804.8 MHz, while the vendor
+ * corner plan keeps interpolating up to the 1843.2 MHz silver TURBO_L1 and
+ * 2150.4 MHz gold TURBO fuse corners.  Taking the top OPP as fmax instead
+ * would run it at the fused voltage of the much faster fuse corner.
+ *
+ * The CPU OPP table can give the fmax of every fuse corner in
+ * "qcom,cpr-fuse-corner-fmax-hz"; zero keeps the OPP derived value.
+ *
+ * Return: Zero for success, negative number on error
+ */
+static int cpr3_fuse_fmax_override(struct cpr_thread *thread)
+{
+	static const char prop[] = "qcom,cpr-fuse-corner-fmax-hz";
+	unsigned int nfc = thread->desc->num_fuse_corners;
+	struct cpr_drv *drv = thread->drv;
+	struct device_node *np;
+	int i, count, ret = 0;
+	u64 fmax;
+
+	np = dev_pm_opp_of_get_opp_desc_node(thread->attached_cpu_dev);
+	if (!np)
+		return 0;
+
+	count = of_property_count_u64_elems(np, prop);
+	if (count == -EINVAL)
+		goto out;
+
+	if (count != nfc) {
+		dev_err(drv->dev, "thread %d: %s needs %u entries\n",
+			thread->id, prop, nfc);
+		ret = -EINVAL;
+		goto out;
+	}
+
+	for (i = 0; i < nfc; i++) {
+		struct fuse_corner *fuse = &thread->fuse_corners[i];
+
+		ret = of_property_read_u64_index(np, prop, i, &fmax);
+		if (ret)
+			goto out;
+
+		if (!fmax)
+			continue;
+
+		if (fmax < fuse->max_freq) {
+			dev_err(drv->dev,
+				"thread %d: fuse corner %d fmax %llu Hz is below its %lu Hz OPP\n",
+				thread->id, i, fmax, fuse->max_freq);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		fuse->max_freq = fmax;
+	}
+out:
+	of_node_put(np);
+
+	return ret;
+}
+
+/**
  * cpr3_corner_init() - Calculate and set-up corners for the CPR HW
  * @thread: Structure holding CPR thread-specific parameters
  *
@@ -1426,6 +1521,7 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 		cpr_get_corner_post_vadj(opp, thread->id,
 					 &cdata[level - 1].oloop_vadj,
 					 &cdata[level - 1].cloop_vadj);
+		cdata[level - 1].floor_uV = cpr3_get_corner_floor(opp, thread->id);
 		cdata[level - 1].fuse_corner = fnum;
 		cdata[level - 1].freq = freq;
 
@@ -1449,6 +1545,18 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 	if (thread->num_corners < 2) {
 		dev_err(drv->dev, "need at least 2 OPPs to use CPR\n");
 		return -EINVAL;
+	}
+
+	ret = cpr3_fuse_fmax_override(thread);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < tdesc->num_fuse_corners; i++) {
+		fuse = &thread->fuse_corners[i];
+		dev_info(drv->dev,
+			 "thread %d fuse corner %d: %d uV [%d-%d], fmax %lu kHz, RO %u quot %d\n",
+			 thread->id, i + 1, fuse->uV, fuse->min_uV, fuse->max_uV,
+			 fuse->max_freq / 1000, fuse->ring_osc_idx, fuse->quot);
 	}
 
 	/*
@@ -1562,6 +1670,17 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 
 		corner->max_uV = fuse->max_uV;
 		corner->min_uV = fuse->min_uV;
+		if (cdata[i].floor_uV) {
+			int floor_uV = roundup(cdata[i].floor_uV, drv->vreg_step);
+
+			if (floor_uV > corner->max_uV) {
+				dev_err(drv->dev,
+					"thread %d corner %d: floor %d uV above ceiling %d uV\n",
+					thread->id, i + 1, floor_uV, corner->max_uV);
+				return -EINVAL;
+			}
+			corner->min_uV = floor_uV;
+		}
 		corner->uV = clamp(corner->uV, corner->min_uV, corner->max_uV);
 		dev_vdbg(drv->dev, "Clamped after interpolation: [%d %d %d]\n",
 			 corner->min_uV, corner->uV, corner->max_uV);
@@ -1594,11 +1713,25 @@ static int cpr3_corner_init(struct cpr_thread *thread)
 			cpr3_restrict_corner(corner, desc->mem_acc_threshold,
 					     0, drv->vreg_step);
 
+		/* Floors increase monotonically, as in the vendor driver */
+		if (i && corner->min_uV < prev_corner->min_uV) {
+			corner->min_uV = prev_corner->min_uV;
+			corner->uV = max(corner->uV, corner->min_uV);
+			corner->max_uV = max(corner->max_uV, corner->min_uV);
+		}
+
 		prev_corner = corner;
 		dev_dbg(drv->dev, "corner %d: [%d %d %d] scaling %d quot %d\n", i,
 			corner->min_uV, corner->uV, corner->max_uV, scaling,
 			fuse->quot - corner->quot_adjust);
 	}
+
+	for (i = 0; i < thread->num_corners; i++)
+		dev_info(drv->dev,
+			 "thread %d corner %d: %lu kHz, %d uV [%d-%d], fuse corner %d\n",
+			 thread->id, i + 1, thread->corners[i].freq / 1000,
+			 thread->corners[i].uV, thread->corners[i].min_uV,
+			 thread->corners[i].max_uV, cdata[i].fuse_corner + 1);
 
 	/* Additional setup for CPRh only */
 	if (desc->cpr_type < CTRL_TYPE_CPRH)
@@ -3302,6 +3435,9 @@ static int cpr_probe(struct platform_device *pdev)
 	ret = nvmem_cell_read_variable_le_u32(dev, "cpr_speed_bin", &drv->speed_bin);
 	if (ret)
 		return ret;
+
+	dev_info(dev, "speed bin %u, CPR fusing revision %u\n",
+		 drv->speed_bin, drv->fusing_rev);
 
 	/*
 	 * Some SoCs require extra corners for MEM-ACC or APM: if
