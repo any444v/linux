@@ -16,5 +16,6 @@ int q6cvp_send_channel_info(struct q6voice_session *cvp, bool is_tx);
 int q6cvp_send_media_format(struct q6voice_session *cvp, int port_id, bool is_tx);
 int q6cvp_topology_commit(struct q6voice_session *cvp);
 int q6cvp_enable(struct q6voice_session *cvp, bool enable);
+int q6cvp_set_mute(struct q6voice_session *cvp, bool is_tx, bool mute);
 
 #endif /*_Q6_CVP_H */

@@ -34,6 +34,10 @@
 
 #define VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT		0x00013198
 
+#define VSS_IVOLUME_CMD_MUTE_V2				0x0001138B
+#define VSS_IVOLUME_DIRECTION_TX			0
+#define VSS_IVOLUME_DIRECTION_RX			1
+
 #define VSS_ICOMMON_CMD_SET_PARAM_V2			0x0001133D
 
 #define VSS_MODULE_CVD_GENERIC				0x0001316E
@@ -291,6 +295,32 @@ int q6cvp_topology_commit(struct q6voice_session *cvp)
 	return q6voice_common_send(cvp, &cmd.hdr);
 }
 EXPORT_SYMBOL_GPL(q6cvp_topology_commit);
+
+struct vss_ivolume_cmd_mute_v2_cmd {
+	struct apr_hdr hdr;
+
+	/* VSS_IVOLUME_DIRECTION_TX or VSS_IVOLUME_DIRECTION_RX */
+	u16 direction;
+	/* 1 to mute, 0 to unmute */
+	u16 mute_flag;
+	/* Ramp to the new state over this many milliseconds */
+	u16 ramp_duration_ms;
+} __packed;
+
+int q6cvp_set_mute(struct q6voice_session *cvp, bool is_tx, bool mute)
+{
+	struct vss_ivolume_cmd_mute_v2_cmd cmd = {};
+
+	cmd.hdr.pkt_size = sizeof(cmd);
+	cmd.hdr.opcode = VSS_IVOLUME_CMD_MUTE_V2;
+
+	cmd.direction = is_tx ? VSS_IVOLUME_DIRECTION_TX : VSS_IVOLUME_DIRECTION_RX;
+	cmd.mute_flag = mute;
+	cmd.ramp_duration_ms = 20;
+
+	return q6voice_common_send(cvp, &cmd.hdr);
+}
+EXPORT_SYMBOL_GPL(q6cvp_set_mute);
 
 int q6cvp_enable(struct q6voice_session *cvp, bool state)
 {

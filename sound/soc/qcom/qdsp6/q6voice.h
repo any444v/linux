@@ -30,4 +30,7 @@ u32 q6voice_get_topology(struct q6voice *v, enum q6voice_path_type path,
 void q6voice_set_topology(struct q6voice *v, enum q6voice_path_type path,
 			  bool capture, u32 topo);
 
+bool q6voice_get_mute(struct q6voice *v, enum q6voice_path_type path);
+int q6voice_set_mute(struct q6voice *v, enum q6voice_path_type path, bool mute);
+
 #endif /*_Q6_VOICE_H */

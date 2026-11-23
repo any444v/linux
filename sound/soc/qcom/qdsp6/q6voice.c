@@ -29,6 +29,8 @@ struct q6voice_path {
 	enum q6voice_path_type type;
 	int tx_port, rx_port;
 	u32 tx_topo, rx_topo;
+	/* Uplink (microphone) muted */
+	bool tx_mute;
 	/* Serialize access to voice path session */
 	struct mutex lock;
 	struct q6voice_path_runtime *runtime;
@@ -121,6 +123,9 @@ static int q6voice_path_start(struct q6voice_path *p)
 		dev_err(dev, "failed to start voice: %d\n", ret);
 		goto start_err;
 	}
+
+	if (p->tx_mute && q6cvp_set_mute(cvp, true, true))
+		dev_warn(dev, "failed to mute the uplink of path %d\n", p->type);
 
 	return ret;
 
@@ -383,6 +388,32 @@ void q6voice_set_topology(struct q6voice *v, enum q6voice_path_type path,
 		p->rx_topo = topo;
 }
 EXPORT_SYMBOL_GPL(q6voice_set_topology);
+
+bool q6voice_get_mute(struct q6voice *v, enum q6voice_path_type path)
+{
+	return v->paths[path].tx_mute;
+}
+EXPORT_SYMBOL_GPL(q6voice_get_mute);
+
+/* Mute the uplink (microphone) of a voice path, now and when it starts */
+int q6voice_set_mute(struct q6voice *v, enum q6voice_path_type path, bool mute)
+{
+	struct q6voice_path *p = &v->paths[path];
+	struct q6voice_session *cvp;
+	int ret = 0;
+
+	mutex_lock(&p->lock);
+	p->tx_mute = mute;
+	if (p->runtime && p->runtime->started == 3) {
+		cvp = p->runtime->sessions[Q6VOICE_SERVICE_CVP];
+		if (cvp)
+			ret = q6cvp_set_mute(cvp, true, mute);
+	}
+	mutex_unlock(&p->lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(q6voice_set_mute);
 
 MODULE_AUTHOR("Stephan Gerhold <stephan@gerhold.net>");
 MODULE_DESCRIPTION("Q6Voice driver");

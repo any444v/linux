@@ -237,7 +237,47 @@ static int q6voice_put_topology_kctrl(struct snd_kcontrol *kcontrol, struct snd_
 	return 1;
 }
 
+/* "Capture Switch": on = microphone live, off = uplink muted */
+static int q6voice_get_uplink_switch(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct soc_mixer_control *mc =
+		(struct soc_mixer_control *)kcontrol->private_value;
+	struct q6voice *v = snd_soc_component_get_drvdata(c);
+	enum q6voice_path_type path = q6voice_get_path(mc->reg);
+
+	if (path >= Q6VOICE_PATH_COUNT)
+		return -EINVAL;
+
+	ucontrol->value.integer.value[0] = !q6voice_get_mute(v, path);
+	return 0;
+}
+
+static int q6voice_put_uplink_switch(struct snd_kcontrol *kcontrol,
+				     struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *c = snd_kcontrol_chip(kcontrol);
+	struct soc_mixer_control *mc =
+		(struct soc_mixer_control *)kcontrol->private_value;
+	struct q6voice *v = snd_soc_component_get_drvdata(c);
+	enum q6voice_path_type path = q6voice_get_path(mc->reg);
+	bool mute = !ucontrol->value.integer.value[0];
+	int ret;
+
+	if (path >= Q6VOICE_PATH_COUNT)
+		return -EINVAL;
+
+	if (q6voice_get_mute(v, path) == mute)
+		return 0;
+
+	ret = q6voice_set_mute(v, path, mute);
+	return ret ? ret : 1;
+}
+
 static const struct snd_kcontrol_new q6voice_kcontrols[] = {
+	SOC_SINGLE_EXT("VoiceMMode1 Uplink Capture Switch", VOICEMMODE1, 0, 1, 0,
+		       q6voice_get_uplink_switch, q6voice_put_uplink_switch),
 	SOC_SINGLE_EXT("VoiceMMode1 TX Topology", VOICEMMODE1, 1, S32_MAX, 0,
 		       q6voice_get_topology_kctrl, q6voice_put_topology_kctrl),
 	SOC_SINGLE_EXT("VoiceMMode1 RX Topology", VOICEMMODE1, 0, S32_MAX, 0,
