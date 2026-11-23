@@ -8,6 +8,18 @@
 
 #include <asm/byteorder.h>
 
+struct dma_chan;
+
+void bam_dma_poll(struct dma_chan *chan);
+
+/*
+ * This data type is used as client metadata buffer in bam driver.
+ */
+struct bam_dma_metadata {
+	/* Actual number of bytes transferred by hardware */
+	u32 xfer_len_bytes;
+};
+
 /*
  * This data type corresponds to the native Command Element
  * supported by BAM DMA Engine.

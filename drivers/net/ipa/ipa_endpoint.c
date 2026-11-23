@@ -11,8 +11,8 @@
 #include <linux/if_rmnet.h>
 #include <linux/types.h>
 
-#include "gsi.h"
-#include "gsi_trans.h"
+#include "ipa_dma.h"
+#include "ipa_trans.h"
 #include "ipa.h"
 #include "ipa_cmd.h"
 #include "ipa_data.h"
@@ -83,6 +83,13 @@ enum ipa_status_mask {
 	IPA_STATUS_MASK_PREV_EOT		= BIT(14),
 	IPA_STATUS_MASK_BYTE_LIMIT		= BIT(15),
 };
+
+/* Cookie stored in the status tag_f_2 field by the IPA tag process
+ * (IPA_IP_PACKET_TAG_STATUS command).  The tag process is used to
+ * flush/synchronize the IPA pipeline, and its status packets carry
+ * this cookie in the 48-bit tag.
+ */
+#define IPA_COOKIE				0x57831603
 
 /* Special IPA filter/router rule field value indicating "rule miss" */
 #define IPA_STATUS_RULE_MISS	0x3ff	/* 10-bit filter/router rule fields */
@@ -156,37 +163,61 @@ static u32 ipa_status_extract(struct ipa *ipa, const void *data,
 	case STATUS_FILTER_LOCAL:
 		return le32_get_bits(word[3], GENMASK(0, 0));
 	case STATUS_FILTER_HASH:
+		if (version <= IPA_VERSION_2_6L)
+			return 0;	/* Not present on IPA v2.x */
 		return le32_get_bits(word[3], GENMASK(1, 1));
 	case STATUS_FILTER_GLOBAL:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[3], GENMASK(1, 1));
 		return le32_get_bits(word[3], GENMASK(2, 2));
 	case STATUS_FILTER_RETAIN:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[3], GENMASK(7, 7));
 		return le32_get_bits(word[3], GENMASK(3, 3));
 	case STATUS_FILTER_RULE_INDEX:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[3], GENMASK(15, 8));
 		return le32_get_bits(word[3], GENMASK(13, 4));
 	/* ROUTER_TABLE is in word 3, bits 14-21 (IPA v5.0+) */
 	case STATUS_ROUTER_LOCAL:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(16, 16));
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(14, 14));
 		return le32_get_bits(word[1], GENMASK(27, 27));
 	case STATUS_ROUTER_HASH:
+		if (version <= IPA_VERSION_2_6L)
+			return 0;	/* Not present on IPA v2.x */
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(15, 15));
 		return le32_get_bits(word[1], GENMASK(28, 28));
 	case STATUS_UCP:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(23, 23));
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(16, 16));
 		return le32_get_bits(word[7], GENMASK(31, 31));
 	case STATUS_ROUTER_TABLE:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(21, 17));
 		if (version < IPA_VERSION_5_0)
 			return le32_get_bits(word[3], GENMASK(21, 17));
 		return le32_get_bits(word[3], GENMASK(21, 14));
 	case STATUS_ROUTER_RULE_INDEX:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(31, 24));
 		return le32_get_bits(word[3], GENMASK(31, 22));
 	case STATUS_NAT_HIT:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(0, 0));
 		return le32_get_bits(word[4], GENMASK(0, 0));
 	case STATUS_NAT_INDEX:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(13, 1));
 		return le32_get_bits(word[4], GENMASK(13, 1));
 	case STATUS_NAT_TYPE:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_get_bits(word[6], GENMASK(15, 14));
 		return le32_get_bits(word[4], GENMASK(15, 14));
 	case STATUS_TAG_LOW32:
 		return le32_get_bits(word[4], GENMASK(31, 16)) |
@@ -194,8 +225,12 @@ static u32 ipa_status_extract(struct ipa *ipa, const void *data,
 	case STATUS_TAG_HIGH16:
 		return le32_get_bits(word[5], GENMASK(31, 16));
 	case STATUS_SEQUENCE:
+		if (version <= IPA_VERSION_2_6L)
+			return 0;	/* Not present on IPA v2.x */
 		return le32_get_bits(word[6], GENMASK(7, 0));
 	case STATUS_TIME_OF_DAY:
+		if (version <= IPA_VERSION_2_6L)
+			return le32_to_cpu(word[5]);
 		return le32_get_bits(word[6], GENMASK(31, 8));
 	case STATUS_HEADER_LOCAL:
 		return le32_get_bits(word[7], GENMASK(0, 0));
@@ -430,16 +465,16 @@ static u32 ipa_endpoint_max(struct ipa *ipa, u32 count,
 }
 
 /* Allocate a transaction to use on a non-command endpoint */
-static struct gsi_trans *ipa_endpoint_trans_alloc(struct ipa_endpoint *endpoint,
+static struct ipa_trans *ipa_endpoint_trans_alloc(struct ipa_endpoint *endpoint,
 						  u32 tre_count)
 {
-	struct gsi *gsi = &endpoint->ipa->gsi;
+	struct ipa_dma *gsi = &endpoint->ipa->dma_subsys;
 	u32 channel_id = endpoint->channel_id;
 	enum dma_data_direction direction;
 
 	direction = endpoint->toward_ipa ? DMA_TO_DEVICE : DMA_FROM_DEVICE;
 
-	return gsi_channel_trans_alloc(gsi, channel_id, tre_count, direction);
+	return ipa_channel_trans_alloc(gsi, channel_id, tre_count, direction);
 }
 
 /* suspend_delay represents suspend for RX, delay for TX endpoints.
@@ -579,6 +614,10 @@ void ipa_endpoint_modem_pause_all(struct ipa *ipa, bool enable)
 {
 	u32 endpoint_id = 0;
 
+	/* Pausing is not supported on IPA v2.6L */
+	if (ipa->version <= IPA_VERSION_2_6L)
+		return;
+
 	while (endpoint_id < ipa->endpoint_count) {
 		struct ipa_endpoint *endpoint = &ipa->endpoint[endpoint_id++];
 
@@ -590,7 +629,7 @@ void ipa_endpoint_modem_pause_all(struct ipa *ipa, bool enable)
 		else if (ipa->version < IPA_VERSION_4_2)
 			ipa_endpoint_program_delay(endpoint, enable);
 		else
-			gsi_modem_channel_flow_control(&ipa->gsi,
+			gsi_modem_channel_flow_control(&ipa->dma_subsys,
 						       endpoint->channel_id,
 						       enable);
 	}
@@ -599,8 +638,10 @@ void ipa_endpoint_modem_pause_all(struct ipa *ipa, bool enable)
 /* Reset all modem endpoints to use the default exception endpoint */
 int ipa_endpoint_modem_exception_reset_all(struct ipa *ipa)
 {
-	struct gsi_trans *trans;
+	struct ipa_trans *trans;
 	u32 endpoint_id;
+	u32 value = 0;
+	u32 value_mask = ~0;
 	u32 count;
 
 	/* We need one command per modem TX endpoint, plus the commands
@@ -612,6 +653,14 @@ int ipa_endpoint_modem_exception_reset_all(struct ipa *ipa)
 		dev_err(ipa->dev,
 			"no transaction to reset modem exception endpoints\n");
 		return -EBUSY;
+	}
+
+	/* On IPA v2.x, the endpoint status register's low-order bit forces
+	 * aggregation closed rather than enabling status.
+	 */
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		value = 1;
+		value_mask = 1;
 	}
 
 	for_each_set_bit(endpoint_id, ipa->defined, ipa->endpoint_count) {
@@ -627,16 +676,17 @@ int ipa_endpoint_modem_exception_reset_all(struct ipa *ipa)
 		reg = ipa_reg(ipa, ENDP_STATUS);
 		offset = reg_n_offset(reg, endpoint_id);
 
-		/* Value written is 0, and all bits are updated.  That
-		 * means status is disabled on the endpoint, and as a
-		 * result all other fields in the register are ignored.
+		/* Value written is 0 (force close on IPA v2.x), and all bits
+		 * are updated.  That means status is disabled on the endpoint,
+		 * and as a result all other fields in the register are ignored.
 		 */
-		ipa_cmd_register_write_add(trans, offset, 0, ~0, false);
+		ipa_cmd_register_write_add(trans, offset, value, value_mask,
+					   false);
 	}
 
 	ipa_cmd_pipeline_clear_add(trans);
 
-	gsi_trans_commit_wait(trans);
+	ipa_trans_commit_wait(trans);
 
 	ipa_cmd_pipeline_clear_wait(ipa);
 
@@ -917,7 +967,15 @@ static void ipa_endpoint_init_mode(struct ipa_endpoint *endpoint)
 		val = reg_encode(reg, ENDP_MODE, IPA_DMA);
 		val |= reg_encode(reg, DEST_PIPE_INDEX, dma_endpoint_id);
 	} else {
+		/* In BASIC mode DEST_PIPE_INDEX is the fallback destination
+		 * used when no filter or routing rule matches.  Stock routes
+		 * these to the AP LAN consumer (endpoint 2); see ipa2-lite's
+		 * REG_IPA_EP_MODE and downstream ipa2_cfg_ep_mode().
+		 */
+		u32 lan_rx_id = ipa->name_map[IPA_ENDPOINT_AP_LAN_RX]->endpoint_id;
+
 		val = reg_encode(reg, ENDP_MODE, IPA_BASIC);
+		val |= reg_encode(reg, DEST_PIPE_INDEX, lan_rx_id);
 	}
 	/* All other bits unspecified (and 0) */
 
@@ -1235,7 +1293,7 @@ static void ipa_endpoint_init_seq(struct ipa_endpoint *endpoint)
  */
 int ipa_endpoint_skb_tx(struct ipa_endpoint *endpoint, struct sk_buff *skb)
 {
-	struct gsi_trans *trans;
+	struct ipa_trans *trans;
 	u32 nr_frags;
 	int ret;
 
@@ -1254,17 +1312,17 @@ int ipa_endpoint_skb_tx(struct ipa_endpoint *endpoint, struct sk_buff *skb)
 	if (!trans)
 		return -EBUSY;
 
-	ret = gsi_trans_skb_add(trans, skb);
+	ret = ipa_trans_skb_add(trans, skb);
 	if (ret)
 		goto err_trans_free;
 	trans->data = skb;	/* transaction owns skb now */
 
-	gsi_trans_commit(trans, !netdev_xmit_more());
+	ipa_trans_commit(trans, !netdev_xmit_more());
 
 	return 0;
 
 err_trans_free:
-	gsi_trans_free(trans);
+	ipa_trans_free(trans);
 
 	return -ENOMEM;
 }
@@ -1298,7 +1356,7 @@ static void ipa_endpoint_status(struct ipa_endpoint *endpoint)
 }
 
 static int ipa_endpoint_replenish_one(struct ipa_endpoint *endpoint,
-				      struct gsi_trans *trans)
+				      struct ipa_trans *trans)
 {
 	struct page *page;
 	u32 buffer_size;
@@ -1315,7 +1373,7 @@ static int ipa_endpoint_replenish_one(struct ipa_endpoint *endpoint,
 	offset = NET_SKB_PAD;
 	len = buffer_size - offset;
 
-	ret = gsi_trans_page_add(trans, page, len, offset);
+	ret = ipa_trans_page_add(trans, page, len, offset);
 	if (ret)
 		put_page(page);
 	else
@@ -1337,7 +1395,7 @@ static int ipa_endpoint_replenish_one(struct ipa_endpoint *endpoint,
  */
 static void ipa_endpoint_replenish(struct ipa_endpoint *endpoint)
 {
-	struct gsi_trans *trans;
+	struct ipa_trans *trans;
 
 	if (!test_bit(IPA_REPLENISH_ENABLED, endpoint->replenish_flags))
 		return;
@@ -1355,7 +1413,7 @@ static void ipa_endpoint_replenish(struct ipa_endpoint *endpoint)
 
 		/* Ring the doorbell if we've got a full batch */
 		doorbell = !(++endpoint->replenish_count % IPA_REPLENISH_BATCH);
-		gsi_trans_commit(trans, doorbell);
+		ipa_trans_commit(trans, doorbell);
 	}
 
 	clear_bit(IPA_REPLENISH_ACTIVE, endpoint->replenish_flags);
@@ -1363,7 +1421,7 @@ static void ipa_endpoint_replenish(struct ipa_endpoint *endpoint)
 	return;
 
 try_again_later:
-	gsi_trans_free(trans);
+	ipa_trans_free(trans);
 	clear_bit(IPA_REPLENISH_ACTIVE, endpoint->replenish_flags);
 
 	/* Whenever a receive buffer transaction completes we'll try to
@@ -1372,7 +1430,7 @@ try_again_later:
 	 * If the hardware has no receive buffers queued, schedule work to
 	 * try replenishing again.
 	 */
-	if (gsi_channel_trans_idle(&endpoint->ipa->gsi, endpoint->channel_id))
+	if (gsi_channel_trans_idle(&endpoint->ipa->dma_subsys, endpoint->channel_id))
 		schedule_delayed_work(&endpoint->replenish_work,
 				      msecs_to_jiffies(1));
 }
@@ -1382,7 +1440,8 @@ static void ipa_endpoint_replenish_enable(struct ipa_endpoint *endpoint)
 	set_bit(IPA_REPLENISH_ENABLED, endpoint->replenish_flags);
 
 	/* Start replenishing if hardware currently has no buffers */
-	if (gsi_channel_trans_idle(&endpoint->ipa->gsi, endpoint->channel_id))
+	if (gsi_channel_trans_idle(&endpoint->ipa->dma_subsys,
+				   endpoint->channel_id))
 		ipa_endpoint_replenish(endpoint);
 }
 
@@ -1448,8 +1507,21 @@ static bool ipa_endpoint_skb_build(struct ipa_endpoint *endpoint,
  /* The format of an IPA packet status structure is the same for several
   * status types (opcodes).  Other types aren't currently supported.
  */
-static bool ipa_status_format_packet(enum ipa_status_opcode opcode)
+static bool ipa_status_format_packet(struct ipa *ipa, u32 opcode)
 {
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		/* IPA v2.x uses enum values, not the v3+ bitmask values. */
+		switch (opcode) {
+		case 0:	/* packet */
+		case 2:	/* dropped */
+		case 3:	/* suspended */
+		case 6:	/* packet, second pass */
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	switch (opcode) {
 	case IPA_STATUS_OPCODE_PACKET:
 	case IPA_STATUS_OPCODE_DROPPED_PACKET:
@@ -1469,7 +1541,7 @@ ipa_endpoint_status_skip(struct ipa_endpoint *endpoint, const void *data)
 	u32 endpoint_id;
 
 	opcode = ipa_status_extract(ipa, data, STATUS_OPCODE);
-	if (!ipa_status_format_packet(opcode))
+	if (!ipa_status_format_packet(ipa, opcode))
 		return true;
 
 	endpoint_id = ipa_status_extract(ipa, data, STATUS_DST_ENDPOINT);
@@ -1488,8 +1560,12 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	u32 endpoint_id;
 
 	status_mask = ipa_status_extract(ipa, data, STATUS_MASK);
-	if (!status_mask)
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		if (!(status_mask & IPA_STATUS_MASK_TAG_VALID))
+			return false;	/* No valid tag */
+	} else if (!status_mask) {
 		return false;	/* No valid tag */
+	}
 
 	/* The status contains a valid tag.  We know the packet was sent to
 	 * this endpoint (already verified by ipa_endpoint_status_skip()).
@@ -1500,6 +1576,28 @@ ipa_endpoint_status_tag_valid(struct ipa_endpoint *endpoint, const void *data)
 	command_endpoint = ipa->name_map[IPA_ENDPOINT_AP_COMMAND_TX];
 	if (endpoint_id == command_endpoint->endpoint_id) {
 		complete(&ipa->completion);
+	} else if (ipa->version <= IPA_VERSION_2_6L) {
+		u32 tag_low32;
+		u32 tag_high16;
+
+		tag_low32 = ipa_status_extract(ipa, data, STATUS_TAG_LOW32);
+		tag_high16 = ipa_status_extract(ipa, data, STATUS_TAG_HIGH16);
+
+		/* The IPA tag process (IPA_IP_PACKET_TAG_STATUS) stores
+		 * IPA_COOKIE in tag_f_2, the high 32 bits of the 48-bit
+		 * tag.  Such a status is a pipeline flush/synchronization
+		 * marker, not an unexpected packet: consume it without
+		 * treating it as an error.
+		 */
+		if (tag_high16 == (IPA_COOKIE >> 16) &&
+		    (tag_low32 >> 16) == (IPA_COOKIE & 0xffff))
+			dev_dbg(ipa->dev,
+				"IPA tag process status from endpoint %u\n",
+				endpoint_id);
+		else
+			dev_err_ratelimited(ipa->dev,
+					    "unexpected tagged packet from endpoint %u\n",
+					    endpoint_id);
 	} else {
 		dev_err(ipa->dev, "unexpected tagged packet from endpoint %u\n",
 			endpoint_id);
@@ -1527,8 +1625,11 @@ ipa_endpoint_status_drop(struct ipa_endpoint *endpoint, const void *data)
 
 	/* Drop the packet if it fails to match a routing rule; otherwise no */
 	rule = ipa_status_extract(ipa, data, STATUS_ROUTER_RULE_INDEX);
+	if (rule == (ipa->version <= IPA_VERSION_2_6L ? 0xff :
+		     IPA_STATUS_RULE_MISS))
+		return true;
 
-	return rule == IPA_STATUS_RULE_MISS;
+	return false;
 }
 
 static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
@@ -1547,9 +1648,13 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		u32 len;
 
 		if (resid < IPA_STATUS_SIZE) {
-			dev_err(dev,
-				"short message (%u bytes < %zu byte status)\n",
-				resid, IPA_STATUS_SIZE);
+			if (ipa->version <= IPA_VERSION_2_6L)
+				dev_dbg(dev, "short RX status transaction (%u bytes)\n",
+					resid);
+			else
+				dev_err(dev,
+					"short message (%u bytes < %zu byte status)\n",
+					resid, IPA_STATUS_SIZE);
 			break;
 		}
 
@@ -1572,6 +1677,16 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		if (endpoint->config.checksum)
 			len += sizeof(struct rmnet_map_dl_csum_trailer);
 
+		if (ipa->version <= IPA_VERSION_2_6L &&
+		    (len > resid || length > buffer_size)) {
+			u32 word0 = le32_to_cpu(*(__le32 *)data);
+
+			dev_err_ratelimited(dev,
+					    "invalid RX status length %u (resid %u, word0 0x%08x)\n",
+					    length, resid, word0);
+			break;
+		}
+
 		if (!ipa_endpoint_status_drop(endpoint, data)) {
 			void *data2;
 			u32 extra;
@@ -1591,11 +1706,16 @@ static void ipa_endpoint_status_parse(struct ipa_endpoint *endpoint,
 		/* Consume status and the full packet it describes */
 		data += len;
 		resid -= len;
+
+		/* A trailing status-sized block is padding, not a packet. */
+		if (ipa->version <= IPA_VERSION_2_6L &&
+		    resid <= IPA_STATUS_SIZE)
+			break;
 	}
 }
 
 void ipa_endpoint_trans_complete(struct ipa_endpoint *endpoint,
-				 struct gsi_trans *trans)
+				 struct ipa_trans *trans)
 {
 	struct page *page;
 
@@ -1616,7 +1736,7 @@ done:
 }
 
 void ipa_endpoint_trans_release(struct ipa_endpoint *endpoint,
-				struct gsi_trans *trans)
+				struct ipa_trans *trans)
 {
 	if (endpoint->toward_ipa) {
 		struct ipa *ipa = endpoint->ipa;
@@ -1646,8 +1766,15 @@ void ipa_endpoint_default_route_set(struct ipa *ipa, u32 endpoint_id)
 	val = reg_encode(reg, ROUTE_DEF_PIPE, endpoint_id);
 	val |= reg_bit(reg, ROUTE_DEF_HDR_TABLE);
 	/* ROUTE_DEF_HDR_OFST is 0 */
-	val |= reg_encode(reg, ROUTE_FRAG_DEF_PIPE, endpoint_id);
-	val |= reg_bit(reg, ROUTE_DEF_RETAIN_HDR);
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		/* Stock v2.5/2.6L: fragments go to the AP's modem TX pipe
+		 * (4) and the default route does not retain the header.
+		 */
+		val |= reg_encode(reg, ROUTE_FRAG_DEF_PIPE, 4);
+	} else {
+		val |= reg_encode(reg, ROUTE_FRAG_DEF_PIPE, endpoint_id);
+		val |= reg_bit(reg, ROUTE_DEF_RETAIN_HDR);
+	}
 
 	iowrite32(val, ipa->reg_virt + reg_offset(reg));
 }
@@ -1671,7 +1798,7 @@ static int ipa_endpoint_reset_rx_aggr(struct ipa_endpoint *endpoint)
 {
 	struct ipa *ipa = endpoint->ipa;
 	struct device *dev = ipa->dev;
-	struct gsi *gsi = &ipa->gsi;
+	struct ipa_dma *gsi = &ipa->dma_subsys;
 	bool suspended = false;
 	dma_addr_t addr;
 	u32 retries;
@@ -1697,13 +1824,13 @@ static int ipa_endpoint_reset_rx_aggr(struct ipa_endpoint *endpoint)
 	 * active.  We'll re-enable the doorbell (if appropriate) when
 	 * we reset again below.
 	 */
-	gsi_channel_reset(gsi, endpoint->channel_id, false);
+	ipa_channel_reset(gsi, endpoint->channel_id, false);
 
 	/* Make sure the channel isn't suspended */
 	suspended = ipa_endpoint_program_suspend(endpoint, false);
 
 	/* Start channel and do a 1 byte read */
-	ret = gsi_channel_start(gsi, endpoint->channel_id);
+	ret = ipa_channel_start(gsi, endpoint->channel_id);
 	if (ret)
 		goto out_suspend_again;
 
@@ -1726,7 +1853,7 @@ static int ipa_endpoint_reset_rx_aggr(struct ipa_endpoint *endpoint)
 
 	gsi_trans_read_byte_done(gsi, endpoint->channel_id);
 
-	ret = gsi_channel_stop(gsi, endpoint->channel_id);
+	ret = ipa_channel_stop(gsi, endpoint->channel_id);
 	if (ret)
 		goto out_suspend_again;
 
@@ -1735,14 +1862,14 @@ static int ipa_endpoint_reset_rx_aggr(struct ipa_endpoint *endpoint)
 	 * complete the channel reset sequence.  Finish by suspending the
 	 * channel again (if necessary).
 	 */
-	gsi_channel_reset(gsi, endpoint->channel_id, true);
+	ipa_channel_reset(gsi, endpoint->channel_id, true);
 
 	usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
 
 	goto out_suspend_again;
 
 err_endpoint_stop:
-	(void)gsi_channel_stop(gsi, endpoint->channel_id);
+	(void)ipa_channel_stop(gsi, endpoint->channel_id);
 out_suspend_again:
 	if (suspended)
 		(void)ipa_endpoint_program_suspend(endpoint, true);
@@ -1762,14 +1889,18 @@ static void ipa_endpoint_reset(struct ipa_endpoint *endpoint)
 
 	/* On IPA v3.5.1, if an RX endpoint is reset while aggregation
 	 * is active, we need to handle things specially to recover.
-	 * All other cases just need to reset the underlying GSI channel.
+	 * All other cases just need to reset the underlying channel.
+	 * The special sequence reads a byte through a GSI TRE, so it
+	 * only applies to GSI-based hardware; BAM (IPA v2.x) just gets
+	 * its pipe reset.
 	 */
-	special = ipa->version < IPA_VERSION_4_0 && !endpoint->toward_ipa &&
+	special = IPA_HAS_GSI(ipa->version) &&
+			ipa->version < IPA_VERSION_4_0 && !endpoint->toward_ipa &&
 			endpoint->config.aggregation;
 	if (special && ipa_endpoint_aggr_active(endpoint))
 		ret = ipa_endpoint_reset_rx_aggr(endpoint);
 	else
-		gsi_channel_reset(&ipa->gsi, channel_id, true);
+		ipa_channel_reset(&ipa->dma_subsys, channel_id, true);
 
 	if (ret)
 		dev_err(ipa->dev,
@@ -1793,7 +1924,8 @@ static void ipa_endpoint_program(struct ipa_endpoint *endpoint)
 		(void)ipa_endpoint_program_suspend(endpoint, false);
 	}
 	ipa_endpoint_init_cfg(endpoint);
-	ipa_endpoint_init_nat(endpoint);
+	if (endpoint->ipa->version > IPA_VERSION_2_6L)
+		ipa_endpoint_init_nat(endpoint);
 	ipa_endpoint_init_hdr(endpoint);
 	ipa_endpoint_init_hdr_ext(endpoint);
 	ipa_endpoint_init_hdr_metadata_mask(endpoint);
@@ -1806,8 +1938,10 @@ static void ipa_endpoint_program(struct ipa_endpoint *endpoint)
 			ipa_endpoint_init_hol_block_disable(endpoint);
 	}
 	ipa_endpoint_init_deaggr(endpoint);
-	ipa_endpoint_init_rsrc_grp(endpoint);
-	ipa_endpoint_init_seq(endpoint);
+	if (endpoint->ipa->version > IPA_VERSION_2_6L) {
+		ipa_endpoint_init_rsrc_grp(endpoint);
+		ipa_endpoint_init_seq(endpoint);
+	}
 	ipa_endpoint_status(endpoint);
 }
 
@@ -1815,10 +1949,10 @@ int ipa_endpoint_enable_one(struct ipa_endpoint *endpoint)
 {
 	u32 endpoint_id = endpoint->endpoint_id;
 	struct ipa *ipa = endpoint->ipa;
-	struct gsi *gsi = &ipa->gsi;
+	struct ipa_dma *gsi = &ipa->dma_subsys;
 	int ret;
 
-	ret = gsi_channel_start(gsi, endpoint->channel_id);
+	ret = ipa_channel_start(gsi, endpoint->channel_id);
 	if (ret) {
 		dev_err(ipa->dev,
 			"error %d starting %cX channel %u for endpoint %u\n",
@@ -1841,7 +1975,7 @@ void ipa_endpoint_disable_one(struct ipa_endpoint *endpoint)
 {
 	u32 endpoint_id = endpoint->endpoint_id;
 	struct ipa *ipa = endpoint->ipa;
-	struct gsi *gsi = &ipa->gsi;
+	struct ipa_dma *gsi = &ipa->dma_subsys;
 	int ret;
 
 	if (!test_bit(endpoint_id, ipa->enabled))
@@ -1855,7 +1989,7 @@ void ipa_endpoint_disable_one(struct ipa_endpoint *endpoint)
 	}
 
 	/* Note that if stop fails, the channel's state is not well-defined */
-	ret = gsi_channel_stop(gsi, endpoint->channel_id);
+	ret = ipa_channel_stop(gsi, endpoint->channel_id);
 	if (ret)
 		dev_err(ipa->dev, "error %d attempting to stop endpoint %u\n",
 			ret, endpoint_id);
@@ -1864,7 +1998,7 @@ void ipa_endpoint_disable_one(struct ipa_endpoint *endpoint)
 void ipa_endpoint_suspend_one(struct ipa_endpoint *endpoint)
 {
 	struct device *dev = endpoint->ipa->dev;
-	struct gsi *gsi = &endpoint->ipa->gsi;
+	struct ipa_dma *gsi = &endpoint->ipa->dma_subsys;
 	int ret;
 
 	if (!test_bit(endpoint->endpoint_id, endpoint->ipa->enabled))
@@ -1875,7 +2009,7 @@ void ipa_endpoint_suspend_one(struct ipa_endpoint *endpoint)
 		(void)ipa_endpoint_program_suspend(endpoint, true);
 	}
 
-	ret = gsi_channel_suspend(gsi, endpoint->channel_id);
+	ret = ipa_channel_suspend(gsi, endpoint->channel_id);
 	if (ret)
 		dev_err(dev, "error %d suspending channel %u\n", ret,
 			endpoint->channel_id);
@@ -1884,7 +2018,7 @@ void ipa_endpoint_suspend_one(struct ipa_endpoint *endpoint)
 void ipa_endpoint_resume_one(struct ipa_endpoint *endpoint)
 {
 	struct device *dev = endpoint->ipa->dev;
-	struct gsi *gsi = &endpoint->ipa->gsi;
+	struct ipa_dma *gsi = &endpoint->ipa->dma_subsys;
 	int ret;
 
 	if (!test_bit(endpoint->endpoint_id, endpoint->ipa->enabled))
@@ -1893,7 +2027,7 @@ void ipa_endpoint_resume_one(struct ipa_endpoint *endpoint)
 	if (!endpoint->toward_ipa)
 		(void)ipa_endpoint_program_suspend(endpoint, false);
 
-	ret = gsi_channel_resume(gsi, endpoint->channel_id);
+	ret = ipa_channel_resume(gsi, endpoint->channel_id);
 	if (ret)
 		dev_err(dev, "error %d resuming channel %u\n", ret,
 			endpoint->channel_id);
@@ -1927,7 +2061,7 @@ void ipa_endpoint_resume(struct ipa *ipa)
 
 static void ipa_endpoint_setup_one(struct ipa_endpoint *endpoint)
 {
-	struct gsi *gsi = &endpoint->ipa->gsi;
+	struct ipa_dma *gsi = &endpoint->ipa->dma_subsys;
 	u32 channel_id = endpoint->channel_id;
 
 	/* Only AP endpoints get set up */
@@ -2142,13 +2276,18 @@ int ipa_endpoint_init(struct ipa *ipa, u32 count,
 {
 	enum ipa_endpoint_name name;
 	u32 filtered;
+	u32 max;
 
 	BUILD_BUG_ON(!IPA_REPLENISH_BATCH);
 
-	/* Number of endpoints is one more than the maximum ID */
-	ipa->endpoint_count = ipa_endpoint_max(ipa, count, data) + 1;
-	if (!ipa->endpoint_count)
+	/* Number of endpoints is one more than the maximum ID.  A zero
+	 * maximum means the configuration was rejected; fail loudly rather
+	 * than silently running with endpoint_count == 1.
+	 */
+	max = ipa_endpoint_max(ipa, count, data);
+	if (!max)
 		return -EINVAL;
+	ipa->endpoint_count = max + 1;
 
 	/* Initialize endpoint state bitmaps */
 	ipa->defined = bitmap_zalloc(ipa->endpoint_count, GFP_KERNEL);
@@ -2175,6 +2314,10 @@ int ipa_endpoint_init(struct ipa *ipa, u32 count,
 		if (data->ee_id == GSI_EE_MODEM && data->toward_ipa)
 			ipa->modem_tx_count++;
 	}
+
+	/* IPA v2.x uses a fixed filter map */
+	if (ipa->version <= IPA_VERSION_2_6L)
+		filtered = 0x1fffff;
 
 	/* Make sure the set of filtered endpoints is valid */
 	if (!ipa_filtered_valid(ipa, filtered)) {

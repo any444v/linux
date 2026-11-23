@@ -58,6 +58,26 @@ struct ipa_qmi {
 int ipa_qmi_setup(struct ipa *ipa);
 
 /**
+ * ipa_qmi_signal_uc_loaded() - Signal that the UC has been loaded
+ * @ipa:		IPA pointer
+ *
+ * This is called when the microcontroller indicates that it is ready.
+ * On IPA v2.x the modem does not send a DRIVER_INIT_COMPLETED request,
+ * so the microcontroller's INIT_COMPLETED response is used to determine
+ * when the IPA is ready.
+ */
+void ipa_qmi_signal_uc_loaded(struct ipa *ipa);
+
+/**
+ * ipa_qmi_wan_filters_install() - (Re)install the WAN downlink filters
+ * @ipa:	IPA pointer
+ *
+ * Called when the modem network interface is opened, after the data call
+ * has been established.
+ */
+void ipa_qmi_wan_filters_install(struct ipa *ipa);
+
+/**
  * ipa_qmi_teardown() - Tear down IPA QMI handles
  * @ipa:		IPA pointer
  */

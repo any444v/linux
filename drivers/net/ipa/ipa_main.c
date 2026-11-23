@@ -4,6 +4,7 @@
  * Copyright (C) 2018-2024 Linaro Ltd.
  */
 
+#include <linux/bitmap.h>
 #include <linux/bug.h>
 #include <linux/firmware.h>
 #include <linux/io.h>
@@ -80,6 +81,14 @@
 /* Divider for 19.2 MHz crystal oscillator clock to get common timer clock */
 #define IPA_XO_CLOCK_DIVIDER	192	/* 1 is subtracted where used */
 
+/* QMAP mux ID used for the modem data path; 0 matches ModemManager's
+ * default rmnet link, vendor-init-style tools may use 1.
+ */
+static uint qmap_mux_id;
+module_param(qmap_mux_id, uint, 0644);
+MODULE_PARM_DESC(qmap_mux_id,
+		 "QMAP mux ID used for the modem data path (default: 0)");
+
 /**
  * enum ipa_firmware_loader: How GSI firmware gets loaded
  *
@@ -115,7 +124,7 @@ int ipa_setup(struct ipa *ipa)
 	struct device *dev = ipa->dev;
 	int ret;
 
-	ret = gsi_setup(&ipa->gsi);
+	ret = ipa_dma_setup(&ipa->dma_subsys);
 	if (ret)
 		return ret;
 
@@ -152,6 +161,11 @@ int ipa_setup(struct ipa *ipa)
 	if (ret)
 		goto err_default_route_clear;
 
+	/* The uC may have signalled INIT_COMPLETED before we enabled the
+	 * interrupt; recover that so the QMI handshake can complete.
+	 */
+	ipa_uc_check_ready(ipa);
+
 	ipa->setup_complete = true;
 
 	dev_info(dev, "IPA driver setup completed successfully\n");
@@ -165,7 +179,7 @@ err_command_disable:
 	ipa_endpoint_disable_one(command_endpoint);
 err_endpoint_teardown:
 	ipa_endpoint_teardown(ipa);
-	gsi_teardown(&ipa->gsi);
+	ipa_dma_teardown(&ipa->dma_subsys);
 
 	return ret;
 }
@@ -189,7 +203,7 @@ static void ipa_teardown(struct ipa *ipa)
 	command_endpoint = ipa->name_map[IPA_ENDPOINT_AP_COMMAND_TX];
 	ipa_endpoint_disable_one(command_endpoint);
 	ipa_endpoint_teardown(ipa);
-	gsi_teardown(&ipa->gsi);
+	ipa_dma_teardown(&ipa->dma_subsys);
 }
 
 static void
@@ -494,6 +508,28 @@ static void ipa_hardware_dcd_deconfig(struct ipa *ipa)
  */
 static void ipa_hardware_config(struct ipa *ipa, const struct ipa_data *data)
 {
+	const struct reg *reg;
+	u32 val;
+
+	/* IPA v2.x requires a software reset and the core clock enabled */
+	if (ipa->version <= IPA_VERSION_2_6L) {
+		reg = ipa_reg(ipa, COMP_SW_RESET);
+		iowrite32(1, ipa->reg_virt + reg_offset(reg));
+		iowrite32(0, ipa->reg_virt + reg_offset(reg));
+
+		/* The vendor stack enables both the core and the 2x DCMP
+		 * clock here, i.e. it writes 0x11 rather than 0x01.
+		 */
+		reg = ipa_reg(ipa, COMP_CFG);
+		val = reg_encode(reg, COMP_CFG_ENABLE, 1);
+		val |= reg_encode(reg, IPA_DCMP_FAST_CLK_EN, 1);
+		iowrite32(val, ipa->reg_virt + reg_offset(reg));
+
+		ipa_hardware_config_bcr(ipa, data);
+
+		return;
+	}
+
 	ipa_hardware_config_bcr(ipa, data);
 	ipa_hardware_config_tx(ipa);
 	ipa_hardware_config_clkon(ipa);
@@ -513,7 +549,40 @@ static void ipa_hardware_config(struct ipa *ipa, const struct ipa_data *data)
 static void ipa_hardware_deconfig(struct ipa *ipa)
 {
 	/* Mostly we just leave things as we set them. */
-	ipa_hardware_dcd_deconfig(ipa);
+	if (ipa->version > IPA_VERSION_2_6L)
+		ipa_hardware_dcd_deconfig(ipa);
+}
+
+/* On IPA v2.6L the V2_ENABLED_PIPES register reports the number of IPA
+ * pipes implemented in hardware; the vendor stack reads it to obtain its
+ * ipa_num_pipes value.  Validate the channel IDs from configuration data
+ * against it instead of trusting them blindly.
+ */
+static void ipa_v2_pipe_count_check(struct ipa *ipa)
+{
+	const struct reg *reg;
+	u32 endpoint_id;
+	u32 pipe_count;
+	u32 channel_id = 0;
+
+	if (ipa->version != IPA_VERSION_2_6L)
+		return;
+
+	reg = ipa_reg(ipa, V2_ENABLED_PIPES);
+	pipe_count = ioread32(ipa->reg_virt + reg_offset(reg));
+	if (!pipe_count)
+		return;
+
+	for_each_set_bit(endpoint_id, ipa->defined, ipa->endpoint_count) {
+		u32 id = ipa->endpoint[endpoint_id].channel_id;
+
+		if (id > channel_id)
+			channel_id = id;
+	}
+
+	if (channel_id >= pipe_count)
+		dev_warn(ipa->dev, "channel %u out of range (hardware has %u pipes)\n",
+			 channel_id, pipe_count);
 }
 
 /**
@@ -528,6 +597,7 @@ static int ipa_config(struct ipa *ipa, const struct ipa_data *data)
 	int ret;
 
 	ipa_hardware_config(ipa, data);
+	ipa_v2_pipe_count_check(ipa);
 
 	ret = ipa_mem_config(ipa);
 	if (ret)
@@ -637,6 +707,14 @@ out_release_firmware:
 }
 
 static const struct of_device_id ipa_match[] = {
+	{
+		.compatible	= "qcom,msm8996-ipa",
+		.data		= &ipa_data_v2_5,
+	},
+	{
+		.compatible	= "qcom,msm8953-ipa",
+		.data		= &ipa_data_v2_6L,
+	},
 	{
 		.compatible	= "qcom,msm8998-ipa",
 		.data		= &ipa_data_v3_1,
@@ -845,6 +923,7 @@ static int ipa_probe(struct platform_device *pdev)
 	ipa->interrupt = interrupt;
 	ipa->power = power;
 	ipa->version = data->version;
+	ipa->qmap_mux_id = qmap_mux_id;
 	ipa->modem_route_count = data->modem_route_count;
 	init_completion(&ipa->completion);
 
@@ -860,15 +939,19 @@ static int ipa_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_mem_exit;
 
-	ret = gsi_init(&ipa->gsi, pdev, ipa->version, data->endpoint_count,
-		       data->endpoint_data);
+	if (IPA_HAS_GSI(ipa->version))
+		ret = gsi_init(&ipa->dma_subsys, pdev, ipa->version,
+			       data->endpoint_count, data->endpoint_data);
+	else
+		ret = bam_init(&ipa->dma_subsys, pdev, ipa->version,
+			       data->endpoint_count, data->endpoint_data);
 	if (ret)
 		goto err_mem_exit;
 
 	/* Result is a non-zero mask of endpoints that support filtering */
 	ret = ipa_endpoint_init(ipa, data->endpoint_count, data->endpoint_data);
 	if (ret)
-		goto err_gsi_exit;
+		goto err_dma_exit;
 
 	ret = ipa_table_init(ipa);
 	if (ret)
@@ -896,8 +979,11 @@ static int ipa_probe(struct platform_device *pdev)
 		goto done;
 
 	if (loader == IPA_LOADER_SELF) {
-		/* The AP is loading GSI firmware; do so now */
-		ret = ipa_firmware_load(dev);
+		/* The AP is loading GSI firmware; do so now.  IPA v2.x
+		 * (BAM) has no GSI firmware to load.
+		 */
+		if (ipa->version > IPA_VERSION_2_6L)
+			ret = ipa_firmware_load(dev);
 		if (ret)
 			goto err_deconfig;
 	} /* Otherwise loader == IPA_LOADER_SKIP */
@@ -920,8 +1006,8 @@ err_table_exit:
 	ipa_table_exit(ipa);
 err_endpoint_exit:
 	ipa_endpoint_exit(ipa);
-err_gsi_exit:
-	gsi_exit(&ipa->gsi);
+err_dma_exit:
+	ipa_dma_exit(&ipa->dma_subsys);
 err_mem_exit:
 	ipa_mem_exit(ipa);
 err_reg_exit:
@@ -987,7 +1073,7 @@ out_power_put:
 	ipa_smp2p_exit(ipa);
 	ipa_table_exit(ipa);
 	ipa_endpoint_exit(ipa);
-	gsi_exit(&ipa->gsi);
+	ipa_dma_exit(&ipa->dma_subsys);
 	ipa_mem_exit(ipa);
 	ipa_reg_exit(ipa);
 	kfree(ipa);
