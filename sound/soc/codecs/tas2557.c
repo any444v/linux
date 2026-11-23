@@ -34,6 +34,16 @@
 
 #include "tas2557.h"
 
+/*
+ * Firmware program to run, e.g. for tas2557_uCDSP.bin of xiaomi-tulip:
+ * 0 "Tuning Mode" (smart amplifier speaker protection, needs the
+ * per-device calibration that is not available here), 1 "ROM Mode 1".
+ * Taken into account the next time the amplifier powers up.
+ */
+static int program = -1;
+module_param(program, int, 0644);
+MODULE_PARM_DESC(program, "Firmware program to use (-1: keep the current one)");
+
 /* Special delay markers embedded in register sequence tables */
 #define TAS2557_UDELAY	0xFFFFFFFE
 #define TAS2557_MDELAY	0xFFFFFFFD
@@ -1616,6 +1626,7 @@ static void tas2557_check_pll_lock(struct tas2557_priv *tas2557)
  */
 static int tas2557_enable(struct tas2557_priv *tas2557, bool enable)
 {
+	unsigned int prog;
 	int ret = 0;
 
 	lockdep_assert_held(&tas2557->lock);
@@ -1634,7 +1645,14 @@ static int tas2557_enable(struct tas2557_priv *tas2557, bool enable)
 		 * rate.  This performs hw/sw reset and loads the firmware's
 		 * PLL block; no manual PLL register writes are needed or done.
 		 */
-		ret = tas2557_set_program(tas2557, tas2557->current_program, -1);
+		prog = tas2557->current_program;
+		if (program >= 0 && program < (int)tas2557->fw->num_programs)
+			prog = program;
+		if (prog != tas2557->current_program)
+			dev_info(tas2557->dev, "switching to program %u (%s)\n",
+				 prog, tas2557->fw->programs[prog].name);
+
+		ret = tas2557_set_program(tas2557, prog, -1);
 		if (ret < 0) {
 			dev_err(tas2557->dev,
 				"firmware program load failed on enable: %d\n",
