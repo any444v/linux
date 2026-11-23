@@ -12,6 +12,15 @@
 
 #define DRV_NAME	"q6voice-dai"
 
+/*
+ * The CVD version of the DSP decides how the voice processor session is
+ * created. It is normally described by "qcom,cvd-v2.3" in the DT; this
+ * overrides it (0: CVD 2.2 and older, 1: CVD 2.3) for bring-up.
+ */
+static int cvd_v2_3 = -1;
+module_param(cvd_v2_3, int, 0444);
+MODULE_PARM_DESC(cvd_v2_3, "Use the CVD 2.3 session setup (-1: from DT, 0: no, 1: yes)");
+
 static enum q6voice_path_type q6voice_get_path(unsigned int dai_id)
 {
 	switch (dai_id) {
@@ -1285,11 +1294,14 @@ static int q6voice_dai_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct q6voice *v;
 	struct device_node *np = dev_of_node(dev);
-	bool cvd_v2_3;
+	bool use_v2_3;
 
-	cvd_v2_3 = of_property_read_bool(np, "qcom,cvd-v2.3");
+	use_v2_3 = of_property_read_bool(np, "qcom,cvd-v2.3");
+	if (cvd_v2_3 >= 0)
+		use_v2_3 = cvd_v2_3;
+	dev_info(dev, "CVD %s session setup\n", use_v2_3 ? "v2.3" : "v2.2");
 
-	v = q6voice_create(dev, cvd_v2_3);
+	v = q6voice_create(dev, use_v2_3);
 	if (IS_ERR(v))
 		return PTR_ERR(v);
 
