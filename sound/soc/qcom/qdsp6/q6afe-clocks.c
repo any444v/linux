@@ -10,6 +10,7 @@
 #include <linux/platform_device.h>
 #include "q6dsp-lpass-clocks.h"
 #include "q6afe.h"
+#include "q6core.h"
 
 #define Q6AFE_CLK(id) {					\
 		.clk_id	= id,				\
@@ -99,6 +100,21 @@ static const struct q6dsp_clk_desc q6dsp_clk_q6afe __maybe_unused = {
 	.lpass_unvote_clk = q6afe_unvote_lpass_core_hw,
 };
 
+static int q6afe_clock_dev_probe(struct platform_device *pdev)
+{
+	/*
+	 * Right after the ADSP has booted, its AFE service may still reject
+	 * clock requests. The first consumer (e.g. the internal digital codec
+	 * enabling its MCLK) then fails to probe and the sound card never
+	 * appears. Only offer the clocks once the ADSP reports ready.
+	 */
+	if (!q6core_is_adsp_ready())
+		return dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+				     "ADSP not ready yet\n");
+
+	return q6dsp_clock_dev_probe(pdev);
+}
+
 #ifdef CONFIG_OF
 static const struct of_device_id q6afe_clock_device_id[] = {
 	{ .compatible = "qcom,q6afe-clocks", .data = &q6dsp_clk_q6afe },
@@ -112,7 +128,7 @@ static struct platform_driver q6afe_clock_platform_driver = {
 		.name = "q6afe-clock",
 		.of_match_table = of_match_ptr(q6afe_clock_device_id),
 	},
-	.probe = q6dsp_clock_dev_probe,
+	.probe = q6afe_clock_dev_probe,
 };
 module_platform_driver(q6afe_clock_platform_driver);
 
