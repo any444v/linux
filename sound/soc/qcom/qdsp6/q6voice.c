@@ -19,6 +19,8 @@
 struct q6voice_path_runtime {
 	struct q6voice_session *sessions[Q6VOICE_SERVICE_COUNT];
 	unsigned int started;
+	/* AFE ports the vocproc session was created for */
+	int tx_port, rx_port;
 };
 
 struct q6voice_path {
@@ -98,6 +100,8 @@ static int q6voice_path_start(struct q6voice_path *p)
 		if (IS_ERR(cvp))
 			return PTR_ERR(cvp);
 		p->runtime->sessions[Q6VOICE_SERVICE_CVP] = cvp;
+		p->runtime->tx_port = p->tx_port;
+		p->runtime->rx_port = p->rx_port;
 	}
 
 	ret = q6cvp_enable(cvp, true);
@@ -136,7 +140,7 @@ int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture)
 
 	mutex_lock(&p->lock);
 	if (!p->runtime) {
-		p->runtime = kzalloc(sizeof(*p), GFP_KERNEL);
+		p->runtime = kzalloc(sizeof(*p->runtime), GFP_KERNEL);
 		if (!p->runtime) {
 			ret = -ENOMEM;
 			goto out;
@@ -176,6 +180,9 @@ static void q6voice_path_stop(struct q6voice_path *p)
 
 	dev_dbg(dev, "stop path %d\n", p->type);
 
+	if (!mvm || !cvp)
+		return;
+
 	ret = q6mvm_start(mvm, false);
 	if (ret)
 		dev_err(dev, "failed to stop voice: %d\n", ret);
@@ -201,6 +208,41 @@ static void q6voice_path_destroy(struct q6voice_path *p)
 
 	p->runtime = NULL;
 	kfree(runtime);
+}
+
+/*
+ * The vocproc (CVP) session is bound to the AFE ports it was created with.
+ * When a running call moves to another device (earpiece -> speaker), stop
+ * the path, drop the CVP session and start again with the new ports.
+ */
+static void q6voice_path_reroute(struct q6voice_path *p)
+{
+	struct q6voice_path_runtime *rt = p->runtime;
+	struct q6voice_session *cvp;
+	int ret;
+
+	if (!rt || rt->started != 3)
+		return;
+	/* 0 is the transient state while one device is off and the next not yet on */
+	if (!p->tx_port || !p->rx_port)
+		return;
+	if (rt->tx_port == p->tx_port && rt->rx_port == p->rx_port)
+		return;
+
+	dev_dbg(p->v->dev, "reroute path %d: rx %d -> %d, tx %d -> %d\n",
+		p->type, rt->rx_port, p->rx_port, rt->tx_port, p->tx_port);
+
+	q6voice_path_stop(p);
+
+	cvp = rt->sessions[Q6VOICE_SERVICE_CVP];
+	if (cvp) {
+		q6voice_session_release(cvp);
+		rt->sessions[Q6VOICE_SERVICE_CVP] = NULL;
+	}
+
+	ret = q6voice_path_start(p);
+	if (ret)
+		dev_err(p->v->dev, "failed to reroute path %d: %d\n", p->type, ret);
 }
 
 int q6voice_stop(struct q6voice *v, enum q6voice_path_type path, bool capture)
@@ -297,10 +339,14 @@ void q6voice_set_port(struct q6voice *v, enum q6voice_path_type path,
 {
 	struct q6voice_path *p = &v->paths[path];
 
+	mutex_lock(&p->lock);
 	if (capture)
 		p->tx_port = index;
 	else
 		p->rx_port = index;
+
+	q6voice_path_reroute(p);
+	mutex_unlock(&p->lock);
 }
 EXPORT_SYMBOL_GPL(q6voice_set_port);
 
