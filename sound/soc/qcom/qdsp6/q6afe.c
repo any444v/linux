@@ -1242,6 +1242,7 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 {
 	struct q6afe *afe = dev_get_drvdata(dev->parent);
 	struct afe_clk_set cset = {0,};
+	int ret, tries;
 
 	cset.clk_set_minor_version = AFE_API_VERSION_CLOCK_SET;
 	cset.clk_id = clk_id;
@@ -1250,9 +1251,26 @@ int q6afe_set_lpass_clock(struct device *dev, int clk_id, int attri,
 	cset.clk_root = clk_root;
 	cset.enable = !!freq;
 
-	return q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
-			       AFE_MODULE_CLOCK_SET, sizeof(cset),
-			       AFE_CLK_TOKEN);
+	/*
+	 * Shortly after the ADSP has booted, its clock manager can still
+	 * reject a clock (status 0x16 on SDM636), even once the ADSP reports
+	 * ready. The first such request is the internal digital codec's MCLK,
+	 * whose probe then fails for good and leaves the phone without a
+	 * sound card. Retry enabling a clock for up to two seconds.
+	 */
+	for (tries = 0; ; tries++) {
+		ret = q6afe_set_param(afe, NULL, &cset, AFE_PARAM_ID_CLOCK_SET,
+				      AFE_MODULE_CLOCK_SET, sizeof(cset),
+				      AFE_CLK_TOKEN);
+		if (ret != -EINVAL || !freq || tries == 20)
+			break;
+		msleep(100);
+	}
+	if (!ret && tries)
+		dev_info(afe->dev, "clock %d enabled after %d retries\n",
+			 clk_id, tries);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(q6afe_set_lpass_clock);
 
