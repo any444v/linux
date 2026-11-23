@@ -168,7 +168,7 @@ struct q6voice_session *q6cvp_session_create(enum q6voice_path_type path,
 					     u16 tx_port, u16 rx_port,
 					     u32 tx_topo, u32 rx_topo)
 {
-	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd;
+	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd = {};
 
 	cmd.hdr.pkt_size = sizeof(cmd);
 	cmd.hdr.opcode = VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V2;
@@ -195,7 +195,7 @@ struct q6voice_session *q6cvp_session_create_v3(enum q6voice_path_type path,
 	 * According to downstream, the v3 parameters are the exact same, with
 	 * the only difference being the opcode.
 	 */
-	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd;
+	struct vss_ivocproc_cmd_create_full_control_session_v2_cmd cmd = {};
 
 	cmd.hdr.pkt_size = sizeof(cmd);
 	cmd.hdr.opcode = VSS_IVOCPROC_CMD_CREATE_FULL_CONTROL_SESSION_V3;
@@ -216,7 +216,7 @@ EXPORT_SYMBOL_GPL(q6cvp_session_create_v3);
 
 int q6cvp_send_channel_info(struct q6voice_session *cvp, bool is_tx)
 {
-	struct vss_icommon_cmd_set_param_v2_cmd cmd;
+	struct vss_icommon_cmd_set_param_v2_cmd cmd = {};
 
 	cmd.hdr.pkt_size = offsetof(struct vss_icommon_cmd_set_param_v2_cmd, param_data.channel_info)
 			 + sizeof(struct vss_param_vocproc_dev_channel_info);
@@ -248,7 +248,7 @@ EXPORT_SYMBOL_GPL(q6cvp_send_channel_info);
 
 int q6cvp_send_media_format(struct q6voice_session *cvp, int port_id, bool is_tx)
 {
-	struct vss_icommon_cmd_set_param_v2_cmd cmd;
+	struct vss_icommon_cmd_set_param_v2_cmd cmd = {};
 
 	cmd.hdr.pkt_size = offsetof(struct vss_icommon_cmd_set_param_v2_cmd, param_data.media_format_info)
 			 + sizeof(struct vss_param_endpoint_media_format_info);
@@ -274,8 +274,8 @@ int q6cvp_send_media_format(struct q6voice_session *cvp, int port_id, bool is_tx
 	cmd.param_data.media_format_info.bits_per_sample = 16;
 	cmd.param_data.media_format_info.sample_rate = 48000;
 
-	q6dsp_map_channels(cmd.param_data.channel_info.channel_mapping,
-			   cmd.param_data.channel_info.num_channels);
+	q6dsp_map_channels(cmd.param_data.media_format_info.channel_mapping,
+			   cmd.param_data.media_format_info.num_channels);
 
 	return q6voice_common_send(cvp, &cmd.hdr);
 }
@@ -283,7 +283,7 @@ EXPORT_SYMBOL_GPL(q6cvp_send_media_format);
 
 int q6cvp_topology_commit(struct q6voice_session *cvp)
 {
-	struct apr_pkt cmd;
+	struct apr_pkt cmd = {};
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = VSS_IVOCPROC_CMD_TOPOLOGY_COMMIT;
@@ -294,7 +294,7 @@ EXPORT_SYMBOL_GPL(q6cvp_topology_commit);
 
 int q6cvp_enable(struct q6voice_session *cvp, bool state)
 {
-	struct apr_pkt cmd;
+	struct apr_pkt cmd = {};
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = state ? VSS_IVOCPROC_CMD_ENABLE : VSS_IVOCPROC_CMD_DISABLE;

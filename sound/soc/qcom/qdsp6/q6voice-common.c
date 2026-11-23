@@ -78,7 +78,7 @@ static void q6voice_session_free(struct kref *ref)
 
 static int q6voice_session_destroy(struct q6voice_session *s)
 {
-	struct apr_pkt cmd;
+	struct apr_pkt cmd = {};
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = APRV2_IBASIC_CMD_DESTROY_SESSION;

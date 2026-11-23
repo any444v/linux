@@ -72,7 +72,7 @@ static inline const char *q6mvm_session_name(enum q6voice_path_type path)
 
 static int q6mvm_set_dual_control(struct q6voice_session *mvm)
 {
-	struct vss_imvm_cmd_set_policy_dual_control_cmd cmd;
+	struct vss_imvm_cmd_set_policy_dual_control_cmd cmd = {};
 
 	cmd.hdr.pkt_size = sizeof(cmd);
 	cmd.hdr.opcode = VSS_IMVM_CMD_SET_POLICY_DUAL_CONTROL;
@@ -84,7 +84,7 @@ static int q6mvm_set_dual_control(struct q6voice_session *mvm)
 
 struct q6voice_session *q6mvm_session_create(enum q6voice_path_type path)
 {
-	struct vss_imvm_cmd_create_control_session_cmd cmd;
+	struct vss_imvm_cmd_create_control_session_cmd cmd = {};
 	struct q6voice_session *mvm;
 	const char *session_name;
 	int ret;
@@ -114,7 +114,7 @@ EXPORT_SYMBOL_GPL(q6mvm_session_create);
 int q6mvm_attach(struct q6voice_session *mvm, struct q6voice_session *cvp,
 		 bool state)
 {
-	struct vss_imvm_cmd_attach_vocproc_cmd cmd;
+	struct vss_imvm_cmd_attach_vocproc_cmd cmd = {};
 
 	cmd.hdr.pkt_size = sizeof(cmd);
 	cmd.hdr.opcode = state ? VSS_IMVM_CMD_ATTACH_VOCPROC : VSS_IMVM_CMD_DETACH_VOCPROC;
@@ -127,7 +127,7 @@ EXPORT_SYMBOL_GPL(q6mvm_attach);
 
 int q6mvm_start(struct q6voice_session *mvm, bool state)
 {
-	struct apr_pkt cmd;
+	struct apr_pkt cmd = {};
 
 	cmd.hdr.pkt_size = APR_HDR_SIZE;
 	cmd.hdr.opcode = state ? VSS_IMVM_CMD_START_VOICE : VSS_IMVM_CMD_STOP_VOICE;
