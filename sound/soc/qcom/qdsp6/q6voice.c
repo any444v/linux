@@ -158,6 +158,16 @@ int q6voice_start(struct q6voice *v, enum q6voice_path_type path, bool capture)
 	if (p->runtime->started != 3)
 		goto out;
 
+	/*
+	 * The PCM may be opened (e.g. by q6voiced when the call becomes
+	 * active) before the mixer controls have selected the AFE ports.
+	 * Start the path once both are set, see q6voice_path_reroute().
+	 */
+	if (!p->tx_port || !p->rx_port) {
+		dev_dbg(v->dev, "path %d waits for its ports\n", path);
+		goto out;
+	}
+
 	ret = q6voice_path_start(p);
 	if (ret) {
 		p->runtime->started &= ~BIT(capture);
